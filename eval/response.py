@@ -123,7 +123,7 @@ def evaluate_generation(model: BaseLM, conversation_history: List[Turn], profile
         try:
             generate_output = model.generate(
                 prompt=generate_prompt,
-                generation_config=generation_cfg
+                cfg=generation_cfg
             )["output"]
             adapted_response = json.loads(generate_output)["response"]
             evaluate_prompt = EVALUATE_PROMPT.format(
@@ -132,7 +132,7 @@ def evaluate_generation(model: BaseLM, conversation_history: List[Turn], profile
             )
             evaluate_output = model.generate(             
                 prompt=evaluate_prompt,
-                generation_config=generation_cfg
+                cfg=generation_cfg
             )["output"]
             evaluation = json.loads(evaluate_output)
             return {

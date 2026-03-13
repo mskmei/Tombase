@@ -1,0 +1,5 @@
+backend: "hf"
+model: "Qwen/Qwen3-4B"
+hf_enable_thinking: true
+max_tokens: 256
+reasoning_effort: "minimal"

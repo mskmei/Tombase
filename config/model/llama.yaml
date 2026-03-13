@@ -1,0 +1,5 @@
+backend: "hf"
+model: "meta-llama/Llama-3.2-3B-Instruct"
+hf_enable_thinking: false
+max_tokens: 256
+reasoning_effort: "minimal"

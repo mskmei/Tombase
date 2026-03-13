@@ -83,7 +83,7 @@ def predict_choice(model: BaseLM, conversation_history: List[Turn], profile: str
     retries = 0
     while True:
         try:
-            prediction = model.generate(prompt, generation_config=generation_cfg)["output"]
+            prediction = model.generate(prompt, cfg=generation_cfg)["output"]
             prediction_data = json.loads(prediction)
             ranking = prediction_data.get('ranking')
             rank = ranking.index(gt_choice) + 1

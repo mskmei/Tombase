@@ -98,3 +98,52 @@ full_dataset:
   run_id: "full_run"
   # Estimated API calls: ~2000-4000
   # Estimated cost: $4-8
+
+# -----------------------------
+# Simple CoT Baseline Examples
+# -----------------------------
+# These are for cot_baseline.py (no hypothesis tracing).
+
+cot_baseline_qwen35_4b:
+  dataset: "prism"
+  n_users: 1000
+  users_per_run: 100
+  seed: 42
+  max_history_turns: 3
+  max_chars: 280
+  reasoning_backend: "hf"
+  reasoning_model: "Qwen/Qwen3-4B"
+  hf_enable_thinking: true
+  score_backend: "openai"
+  score_model: "gpt-5"
+  output_dir: "baseline_results"
+  run_id: "cot_qwen35_4b"
+
+cot_baseline_llama32_3b:
+  dataset: "prism"
+  n_users: 1000
+  users_per_run: 100
+  seed: 42
+  max_history_turns: 3
+  max_chars: 280
+  reasoning_backend: "hf"
+  reasoning_model: "meta-llama/Llama-3.2-3B-Instruct"
+  hf_enable_thinking: false
+  score_backend: "openai"
+  score_model: "gpt-5"
+  output_dir: "baseline_results"
+  run_id: "cot_llama32_3b"
+
+cot_baseline_gpt4omini:
+  dataset: "prism"
+  n_users: 1000
+  users_per_run: 100
+  seed: 42
+  max_history_turns: 3
+  max_chars: 280
+  reasoning_backend: "openai"
+  reasoning_model: "gpt-4o-mini"
+  score_backend: "openai"
+  score_model: "gpt-5"
+  output_dir: "baseline_results"
+  run_id: "cot_gpt4omini"
