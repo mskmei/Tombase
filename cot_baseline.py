@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import random
 from collections import defaultdict
 from statistics import mean
@@ -7,6 +8,46 @@ from typing import Dict, List, Tuple
 
 from data import Turn, load_data
 from model import GenerationConfig, HFModel, OpenAIModel
+
+
+def _plot_turn_trends(per_turn_stats: Dict[str, Dict[str, float]], output_path: str):
+    import matplotlib.pyplot as plt
+
+    turns = sorted(int(t) for t in per_turn_stats.keys())
+    if not turns:
+        return
+
+    x = [t + 1 for t in turns]
+    acc = [per_turn_stats[str(t)]["accuracy"] for t in turns]
+    rank = [per_turn_stats[str(t)]["ranking_score"] for t in turns]
+    gen = [per_turn_stats[str(t)]["generation_score"] for t in turns]
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    axes[0].plot(x, acc, marker="o", linewidth=2, color="tab:blue")
+    axes[0].set_title("Accuracy by Turn (Full-Length Users)")
+    axes[0].set_xlabel("Turn")
+    axes[0].set_ylabel("Accuracy")
+    axes[0].set_ylim(0.0, 1.0)
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(x, rank, marker="s", linewidth=2, color="tab:orange")
+    axes[1].set_title("Ranking Score by Turn (Full-Length Users)")
+    axes[1].set_xlabel("Turn")
+    axes[1].set_ylabel("Ranking Score")
+    axes[1].set_ylim(0.0, 1.0)
+    axes[1].grid(True, alpha=0.3)
+
+    axes[2].plot(x, gen, marker="^", linewidth=2, color="tab:green")
+    axes[2].set_title("Generation Score by Turn (Full-Length Users)")
+    axes[2].set_xlabel("Turn")
+    axes[2].set_ylabel("Generation Score")
+    axes[2].set_ylim(1.0, 10.0)
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
 
 
 COT_RANK_PROMPT = """
@@ -245,6 +286,56 @@ def aggregate_per_turn(turn_metrics: Dict[int, List[float]]) -> Dict[str, Dict[s
     return out
 
 
+def aggregate_per_turn_full_length_users(results: List[Dict]) -> Tuple[Dict[str, Dict[str, float]], int, int]:
+    """
+    Aggregate per-turn metrics using only users that reach the global max turn.
+
+    Returns:
+      per_turn_stats: dict keyed by turn index string
+      max_turn_index: global max turn index
+      n_full_length_users: number of users included
+    """
+    if not results:
+        return {}, -1, 0
+
+    user_max_turn = {}
+    for user_res in results:
+        turns = [tr["turn"] for tr in user_res.get("turn_results", [])]
+        user_max_turn[user_res["user_id"]] = max(turns) if turns else -1
+
+    max_turn_index = max(user_max_turn.values()) if user_max_turn else -1
+    full_users = {uid for uid, mt in user_max_turn.items() if mt == max_turn_index}
+
+    per_turn_acc = defaultdict(list)
+    per_turn_rank = defaultdict(list)
+    per_turn_gen = defaultdict(list)
+
+    for user_res in results:
+        if user_res["user_id"] not in full_users:
+            continue
+        for tr in user_res.get("turn_results", []):
+            t = tr["turn"]
+            per_turn_acc[t].append(tr["accuracy"])
+            per_turn_rank[t].append(tr["ranking_score"])
+            per_turn_gen[t].append(tr["generation_score"])
+
+    per_turn_stats = {}
+    for t in range(max_turn_index + 1):
+        acc_vals = per_turn_acc.get(t, [])
+        rank_vals = per_turn_rank.get(t, [])
+        gen_vals = per_turn_gen.get(t, [])
+        if not acc_vals or not rank_vals or not gen_vals:
+            continue
+        per_turn_stats[str(t)] = {
+            "accuracy": mean(acc_vals),
+            "ranking_score": mean(rank_vals),
+            "generation_score": mean(gen_vals),
+            "count": len(acc_vals),
+        }
+
+    return per_turn_stats, max_turn_index, len(full_users)
+
+
 def run_baseline(args):
     random.seed(args.seed)
 
@@ -332,9 +423,16 @@ def run_baseline(args):
         "turn_generation_score": aggregate_per_turn(per_turn_gen),
     }
 
-    summary = {"overall": overall, "avg_per_turn": analysis_summary}
+    # Your requested trend view: only users with the longest turn length.
+    full_turn_stats, max_turn_index, n_full_users = aggregate_per_turn_full_length_users(results)
+    analysis_summary["turn_trend_full_length_users"] = {
+        "max_turn_index": max_turn_index,
+        "max_turn": max_turn_index + 1 if max_turn_index >= 0 else 0,
+        "n_full_length_users": n_full_users,
+        "per_turn": full_turn_stats,
+    }
 
-    import os
+    summary = {"overall": overall, "avg_per_turn": analysis_summary}
 
     run_dir = os.path.join(args.output_dir, args.run_id)
     os.makedirs(run_dir, exist_ok=True)
@@ -342,6 +440,7 @@ def run_baseline(args):
     results_path = os.path.join(run_dir, "results.json")
     summary_path = os.path.join(run_dir, "summary.json")
     analysis_path = os.path.join(run_dir, "analysis_summary.json")
+    trend_plot_path = os.path.join(run_dir, "turn_metric_trends_full_length_users.png")
 
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
@@ -350,11 +449,14 @@ def run_baseline(args):
     with open(analysis_path, "w", encoding="utf-8") as f:
         json.dump(analysis_summary, f, indent=2, ensure_ascii=False)
 
+    _plot_turn_trends(full_turn_stats, trend_plot_path)
+
     print("=== CoT Baseline Complete ===")
     print(json.dumps(overall, indent=2))
     print(f"Saved results: {results_path}")
     print(f"Saved summary: {summary_path}")
     print(f"Saved per-turn metrics: {analysis_path}")
+    print(f"Saved turn trend plot: {trend_plot_path}")
 
 
 def parse_args():
