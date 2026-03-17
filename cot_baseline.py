@@ -458,8 +458,18 @@ def run_baseline(args):
     loaded_users = load_data(args.dataset, n_users=args.n_users, seed=args.seed)
     users = loaded_users[: args.users_per_run] if args.users_per_run is not None else loaded_users
 
+    # Pre-compute total evaluable turns for simple progress reporting.
+    total_turns_planned = 0
+    for user in users:
+        for conv in user.conversations:
+            for turn in conv.turns:
+                if _resolve_chosen_idx(turn) >= 0:
+                    total_turns_planned += 1
+
     all_acc, all_rank, all_gen, all_rel = [], [], [], []
     skipped_unlabeled_turns = 0
+    processed_turns = 0
+    completed_users = 0
     per_turn_acc = defaultdict(list)
     per_turn_rank = defaultdict(list)
     per_turn_gen = defaultdict(list)
@@ -467,6 +477,10 @@ def run_baseline(args):
     results = []
 
     for user in users:
+        print(
+            f"[Progress] User {completed_users + 1}/{len(users)} ({user.user_id}) started. "
+            f"Processed turns: {processed_turns}/{total_turns_planned}."
+        )
         user_result = {"user_id": user.user_id, "turn_results": []}
         for conv in user.conversations:
             conversation_history: List[Turn] = []
@@ -492,6 +506,14 @@ def run_baseline(args):
 
                 user_result["turn_results"].append({"turn": ti, **metrics})
 
+                processed_turns += 1
+                if processed_turns % 10 == 0 or processed_turns == total_turns_planned:
+                    pct = (100.0 * processed_turns / total_turns_planned) if total_turns_planned else 100.0
+                    print(
+                        f"[Progress] Turns {processed_turns}/{total_turns_planned} "
+                        f"({pct:.1f}%), skipped_unlabeled={skipped_unlabeled_turns}"
+                    )
+
                 all_acc.append(metrics["accuracy"])
                 all_rank.append(metrics["ranking_score"])
                 all_gen.append(metrics["generation_score"])
@@ -503,6 +525,12 @@ def run_baseline(args):
                 per_turn_rel[ti].append(metrics["relative_gpt_score"])
 
         results.append(user_result)
+        completed_users += 1
+        print(
+            f"[Progress] User {completed_users}/{len(users)} completed. "
+            f"Processed turns: {processed_turns}/{total_turns_planned}, "
+            f"skipped_unlabeled={skipped_unlabeled_turns}."
+        )
 
     overall = {
         "accuracy": mean(all_acc) if all_acc else 0.0,
