@@ -116,11 +116,11 @@ Scores are 0-5:
 0 = Opposes/contradicts key dimensions.
 
 Output valid JSON only:
-{
+{{
     "dimensions": ["...", "..."],
-    "scores": [s0, s1, ..., s{c-1}],
+    "scores": [s0, s1, ...],
     "justification": "Brief explanation."
-}
+}}
 
 Rules:
 - scores length MUST equal number of candidates.
