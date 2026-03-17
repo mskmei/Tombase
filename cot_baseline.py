@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import random
+import re
 from collections import defaultdict
 from statistics import mean
 from typing import Dict, List, Tuple
@@ -21,8 +22,9 @@ def _plot_turn_trends(per_turn_stats: Dict[str, Dict[str, float]], output_path: 
     acc = [per_turn_stats[str(t)]["accuracy"] for t in turns]
     rank = [per_turn_stats[str(t)]["ranking_score"] for t in turns]
     gen = [per_turn_stats[str(t)]["generation_score"] for t in turns]
+    rel = [per_turn_stats[str(t)]["relative_gpt_score"] for t in turns]
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig, axes = plt.subplots(1, 4, figsize=(24, 5))
 
     axes[0].plot(x, acc, marker="o", linewidth=2, color="tab:blue")
     axes[0].set_title("Accuracy by Turn (Full-Length Users)")
@@ -42,8 +44,15 @@ def _plot_turn_trends(per_turn_stats: Dict[str, Dict[str, float]], output_path: 
     axes[2].set_title("Generation Score by Turn (Full-Length Users)")
     axes[2].set_xlabel("Turn")
     axes[2].set_ylabel("Generation Score")
-    axes[2].set_ylim(1.0, 10.0)
+    axes[2].set_ylim(0.0, 5.0)
     axes[2].grid(True, alpha=0.3)
+
+    axes[3].plot(x, rel, marker="d", linewidth=2, color="tab:red")
+    axes[3].set_title("Relative GPT Score by Turn (Full-Length Users)")
+    axes[3].set_xlabel("Turn")
+    axes[3].set_ylabel("Relative GPT Score")
+    axes[3].set_ylim(-5.0, 5.0)
+    axes[3].grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=220, bbox_inches="tight")
@@ -86,52 +95,45 @@ Return exactly:
 
 
 EVALUATE_PROMPT = """
-You are evaluating whether an Adapted response aligns more closely with the user's chosen response.
+You are evaluating the similarity between an Adapted response and a set of candidate responses in the context of user preferences.
 
-Given:
-- Current user message
-- Candidate responses (with chosen or rejected specified)
-- Adapted response (to evaluate)
-
-Goal:
-Determine whether the Adapted response is more similar to the Chosen candidate than to the Rejected candidate.
+Inputs:
+- Current turn with c candidates
+- Adapted response
 
 Step 1:
-Identify key preference-relevant differences between Chosen and Rejected.
-Focus on (not exhaustive, and only include if relevant):
-- Underlying value
-- Tone
-- Structure
-- Information density
-- Level of abstraction
-- Actionability
-- Framing
+Identify 2-4 preference-relevant dimensions that distinguish the candidates.
+Use short canonical labels (e.g., "values", "information_density", "structure", "actionability", "tone", "framing", "abstraction").
 
 Step 2:
-Compare the Adapted response to both candidates along those dimensions.
+Using those dimensions, score how similar the Adapted response is to EACH candidate.
+Scores are 0-5:
+5 = Near-identical on key dimensions.
+4 = Strong match on most key dimensions.
+3 = Partial match.
+2 = Weak match.
+1 = Very weak match.
+0 = Opposes/contradicts key dimensions.
 
-Evaluation principles:
-- Only consider dimensions that distinguish Chosen from Rejected.
-- Do not assume hidden user traits.
-
-Scoring rubric (1-10):
-
-9-10: Adapted clearly reflects the distinguishing qualities of the Chosen candidate.
-7-8: Adapted mostly reflects Chosen, with minor resemblance to Rejected.
-5-6: Mixed; partially resembles both.
-3-4: Adapted resembles Rejected more on key distinguishing aspects.
-1-2: Adapted strongly resembles Rejected.
-
-Output JSON only:
+Output valid JSON only:
 {
-  "reason": "2-3 sentences describing the key distinguishing signals and how Adapted compares.",
-  "score": 1-10
+    "dimensions": ["...", "..."],
+    "scores": [s0, s1, ..., s{c-1}],
+    "justification": "Brief explanation."
 }
 
-[Interaction]
+Rules:
+- scores length MUST equal number of candidates.
+- scores[i] corresponds to candidate i.
+- Use the same dimensions for scoring all candidates.
+
+[Current turn]
 {current_turn}
 
-[Adapted response]
+[Number of candidates]
+c={c}
+
+[Adapted]
 {adapted}
 """
 
@@ -167,11 +169,42 @@ def _build_candidates(turn: Turn, max_chars: int) -> str:
 
 
 def _extract_json(text: str) -> Dict:
-    left = text.find("{")
-    right = text.rfind("}")
+    # Remove visible reasoning tags if model emits them.
+    cleaned = re.sub(r"<think>[\\s\\S]*?</think>", "", text, flags=re.IGNORECASE)
+    if "<think>" in cleaned and "</think>" not in cleaned:
+        cleaned = cleaned.split("<think>", 1)[0]
+
+    # Remove markdown code fences if present.
+    cleaned = cleaned.replace("```json", "").replace("```", "")
+
+    left = cleaned.find("{")
+    right = cleaned.rfind("}")
     if left == -1 or right == -1 or right < left:
         raise ValueError(f"No JSON object found in output: {text}")
-    return json.loads(text[left : right + 1])
+    return json.loads(cleaned[left : right + 1])
+
+
+def _repair_ranking_output(
+    reasoning_model,
+    raw_output: str,
+    n_candidates: int,
+    reasoning_cfg: GenerationConfig,
+) -> List[int]:
+    repair_prompt = f"""
+Convert the following model output into valid JSON only.
+
+Requirements:
+- Output exactly one JSON object
+- Include key \"ranking\" as a full permutation of integers 1..{n_candidates}
+- Include key \"reason\" as one short sentence
+- No markdown, no extra text
+
+Text to convert:
+{raw_output}
+"""
+    repaired = reasoning_model.generate(repair_prompt, cfg=reasoning_cfg)["output"]
+    repaired_json = _extract_json(repaired)
+    return _normalize_ranking(repaired_json.get("ranking"), n_candidates=n_candidates)
 
 
 def _normalize_ranking(raw_ranking, n_candidates: int) -> List[int]:
@@ -217,6 +250,7 @@ def predict_ranking_and_metrics(
     score_cfg: GenerationConfig,
     max_history_turns: int,
     max_chars: int,
+    ranking_fail_mode: str = "fallback",
 ) -> Dict[str, float]:
     current_turn = conversation_history[-1]
     history = _build_history(conversation_history, max_history_turns=max_history_turns, max_chars=max_chars)
@@ -231,16 +265,38 @@ def predict_ranking_and_metrics(
     )
 
     retries = 0
+    n_candidates = len(current_turn.candidates)
+    last_exc = None
     while True:
         try:
             output = reasoning_model.generate(prompt, cfg=reasoning_cfg)["output"]
             ranking_json = _extract_json(output)
-            ranking = _normalize_ranking(ranking_json.get("ranking"), n_candidates=len(current_turn.candidates))
+            ranking = _normalize_ranking(ranking_json.get("ranking"), n_candidates=n_candidates)
             break
         except Exception as exc:
+            last_exc = exc
+            # One repair attempt from raw model text before consuming a retry.
+            try:
+                ranking = _repair_ranking_output(
+                    reasoning_model=reasoning_model,
+                    raw_output=output if "output" in locals() else str(exc),
+                    n_candidates=n_candidates,
+                    reasoning_cfg=reasoning_cfg,
+                )
+                break
+            except Exception as repair_exc:
+                last_exc = repair_exc
             retries += 1
             if retries > reasoning_cfg.max_retries:
-                raise ValueError(f"Failed to get valid ranking after {reasoning_cfg.max_retries} retries: {exc}")
+                if ranking_fail_mode == "fallback":
+                    print(
+                        f"[WARN] Ranking parse failed after retries; fallback ranking used. Last error: {last_exc}"
+                    )
+                    ranking = list(range(1, n_candidates + 1))
+                    break
+                raise ValueError(
+                    f"Failed to get valid ranking after {reasoning_cfg.max_retries} retries: {last_exc}"
+                )
 
     gt_choice = current_turn.chosen_idx + 1
     rank = ranking.index(gt_choice) + 1
@@ -250,7 +306,8 @@ def predict_ranking_and_metrics(
     top_choice_idx = ranking[0] - 1
     adapted_response = current_turn.candidates[top_choice_idx]
     eval_prompt = EVALUATE_PROMPT.format(
-        current_turn=current_turn.format(include_candidates=True, include_choice=True),
+        current_turn=current_turn.format(include_candidates=True, include_choice=False),
+        c=n_candidates,
         adapted=adapted_response,
     )
 
@@ -259,7 +316,16 @@ def predict_ranking_and_metrics(
         try:
             score_output = scoring_model.generate(eval_prompt, cfg=score_cfg)["output"]
             score_json = _extract_json(score_output)
-            generation_score = float(score_json["score"])
+            scores = score_json["scores"]
+            if not isinstance(scores, list) or len(scores) != n_candidates:
+                raise ValueError(f"scores length mismatch: expected {n_candidates}, got {len(scores) if isinstance(scores, list) else 'non-list'}")
+            scores = [float(s) for s in scores]
+            generation_score = scores[current_turn.chosen_idx]
+            if n_candidates < 2:
+                relative_gpt_score = 0.0
+            else:
+                best_other = max(scores[i] for i in range(n_candidates) if i != current_turn.chosen_idx)
+                relative_gpt_score = generation_score - best_other
             break
         except Exception as exc:
             eval_retries += 1
@@ -270,6 +336,7 @@ def predict_ranking_and_metrics(
         "accuracy": accuracy,
         "ranking_score": ranking_score,
         "generation_score": generation_score,
+        "relative_gpt_score": relative_gpt_score,
         "predicted_idx": top_choice_idx,
         "actual_idx": current_turn.chosen_idx,
     }
@@ -309,6 +376,7 @@ def aggregate_per_turn_full_length_users(results: List[Dict]) -> Tuple[Dict[str,
     per_turn_acc = defaultdict(list)
     per_turn_rank = defaultdict(list)
     per_turn_gen = defaultdict(list)
+    per_turn_rel = defaultdict(list)
 
     for user_res in results:
         if user_res["user_id"] not in full_users:
@@ -318,18 +386,21 @@ def aggregate_per_turn_full_length_users(results: List[Dict]) -> Tuple[Dict[str,
             per_turn_acc[t].append(tr["accuracy"])
             per_turn_rank[t].append(tr["ranking_score"])
             per_turn_gen[t].append(tr["generation_score"])
+            per_turn_rel[t].append(tr["relative_gpt_score"])
 
     per_turn_stats = {}
     for t in range(max_turn_index + 1):
         acc_vals = per_turn_acc.get(t, [])
         rank_vals = per_turn_rank.get(t, [])
         gen_vals = per_turn_gen.get(t, [])
-        if not acc_vals or not rank_vals or not gen_vals:
+        rel_vals = per_turn_rel.get(t, [])
+        if not acc_vals or not rank_vals or not gen_vals or not rel_vals:
             continue
         per_turn_stats[str(t)] = {
             "accuracy": mean(acc_vals),
             "ranking_score": mean(rank_vals),
             "generation_score": mean(gen_vals),
+            "relative_gpt_score": mean(rel_vals),
             "count": len(acc_vals),
         }
 
@@ -374,10 +445,11 @@ def run_baseline(args):
     loaded_users = load_data(args.dataset, n_users=args.n_users, seed=args.seed)
     users = loaded_users[: args.users_per_run] if args.users_per_run is not None else loaded_users
 
-    all_acc, all_rank, all_gen = [], [], []
+    all_acc, all_rank, all_gen, all_rel = [], [], [], []
     per_turn_acc = defaultdict(list)
     per_turn_rank = defaultdict(list)
     per_turn_gen = defaultdict(list)
+    per_turn_rel = defaultdict(list)
     results = []
 
     for user in users:
@@ -394,6 +466,7 @@ def run_baseline(args):
                     score_cfg=score_cfg,
                     max_history_turns=args.max_history_turns,
                     max_chars=args.max_chars,
+                    ranking_fail_mode=args.ranking_fail_mode,
                 )
 
                 user_result["turn_results"].append({"turn": ti, **metrics})
@@ -401,10 +474,12 @@ def run_baseline(args):
                 all_acc.append(metrics["accuracy"])
                 all_rank.append(metrics["ranking_score"])
                 all_gen.append(metrics["generation_score"])
+                all_rel.append(metrics["relative_gpt_score"])
 
                 per_turn_acc[ti].append(metrics["accuracy"])
                 per_turn_rank[ti].append(metrics["ranking_score"])
                 per_turn_gen[ti].append(metrics["generation_score"])
+                per_turn_rel[ti].append(metrics["relative_gpt_score"])
 
         results.append(user_result)
 
@@ -412,6 +487,7 @@ def run_baseline(args):
         "accuracy": mean(all_acc) if all_acc else 0.0,
         "ranking_score": mean(all_rank) if all_rank else 0.0,
         "generation_score": mean(all_gen) if all_gen else 0.0,
+        "relative_gpt_score": mean(all_rel) if all_rel else 0.0,
         "n_loaded_users": len(loaded_users),
         "n_users": len(users),
         "n_turns": len(all_acc),
@@ -421,6 +497,7 @@ def run_baseline(args):
         "turn_accuracy": aggregate_per_turn(per_turn_acc),
         "turn_ranking_score": aggregate_per_turn(per_turn_rank),
         "turn_generation_score": aggregate_per_turn(per_turn_gen),
+        "turn_relative_gpt_score": aggregate_per_turn(per_turn_rel),
     }
 
     # Your requested trend view: only users with the longest turn length.
@@ -484,6 +561,7 @@ def parse_args():
     parser.add_argument("--max-chars", type=int, default=280)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--retry-delay", type=float, default=0.5)
+    parser.add_argument("--ranking-fail-mode", type=str, choices=["raise", "fallback"], default="fallback")
 
     parser.add_argument("--hf-enable-thinking", action="store_true")
 
