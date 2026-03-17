@@ -228,6 +228,15 @@ def _normalize_ranking(raw_ranking, n_candidates: int) -> List[int]:
     return ranking
 
 
+def _resolve_chosen_idx(turn: Turn) -> int:
+    """Return a valid chosen index when available, otherwise -1."""
+    if 0 <= turn.chosen_idx < len(turn.candidates):
+        return turn.chosen_idx
+    if turn.chosen and turn.chosen in turn.candidates:
+        return turn.candidates.index(turn.chosen)
+    return -1
+
+
 def build_model(
     backend: str,
     model_name: str,
@@ -253,6 +262,10 @@ def predict_ranking_and_metrics(
     ranking_fail_mode: str = "fallback",
 ) -> Dict[str, float]:
     current_turn = conversation_history[-1]
+    resolved_chosen_idx = _resolve_chosen_idx(current_turn)
+    if resolved_chosen_idx < 0:
+        raise ValueError("Current turn has no valid chosen candidate index.")
+
     history = _build_history(conversation_history, max_history_turns=max_history_turns, max_chars=max_chars)
     current_message = _compact_text(current_turn.user_message, max_chars)
     candidates = _build_candidates(current_turn, max_chars=max_chars)
@@ -298,7 +311,7 @@ def predict_ranking_and_metrics(
                     f"Failed to get valid ranking after {reasoning_cfg.max_retries} retries: {last_exc}"
                 )
 
-    gt_choice = current_turn.chosen_idx + 1
+    gt_choice = resolved_chosen_idx + 1
     rank = ranking.index(gt_choice) + 1
     ranking_score = (len(ranking) - rank) / (len(ranking) - 1)
     accuracy = 1.0 if rank == 1 else 0.0
@@ -320,11 +333,11 @@ def predict_ranking_and_metrics(
             if not isinstance(scores, list) or len(scores) != n_candidates:
                 raise ValueError(f"scores length mismatch: expected {n_candidates}, got {len(scores) if isinstance(scores, list) else 'non-list'}")
             scores = [float(s) for s in scores]
-            generation_score = scores[current_turn.chosen_idx]
+            generation_score = scores[resolved_chosen_idx]
             if n_candidates < 2:
                 relative_gpt_score = 0.0
             else:
-                best_other = max(scores[i] for i in range(n_candidates) if i != current_turn.chosen_idx)
+                best_other = max(scores[i] for i in range(n_candidates) if i != resolved_chosen_idx)
                 relative_gpt_score = generation_score - best_other
             break
         except Exception as exc:
@@ -338,7 +351,7 @@ def predict_ranking_and_metrics(
         "generation_score": generation_score,
         "relative_gpt_score": relative_gpt_score,
         "predicted_idx": top_choice_idx,
-        "actual_idx": current_turn.chosen_idx,
+        "actual_idx": resolved_chosen_idx,
     }
 
 
@@ -446,6 +459,7 @@ def run_baseline(args):
     users = loaded_users[: args.users_per_run] if args.users_per_run is not None else loaded_users
 
     all_acc, all_rank, all_gen, all_rel = [], [], [], []
+    skipped_unlabeled_turns = 0
     per_turn_acc = defaultdict(list)
     per_turn_rank = defaultdict(list)
     per_turn_gen = defaultdict(list)
@@ -457,6 +471,13 @@ def run_baseline(args):
         for conv in user.conversations:
             conversation_history: List[Turn] = []
             for ti, turn in enumerate(conv.turns):
+                resolved_chosen_idx = _resolve_chosen_idx(turn)
+                if resolved_chosen_idx < 0:
+                    skipped_unlabeled_turns += 1
+                    continue
+                if resolved_chosen_idx != turn.chosen_idx:
+                    turn.chosen_idx = resolved_chosen_idx
+
                 conversation_history.append(turn)
                 metrics = predict_ranking_and_metrics(
                     reasoning_model=reasoning_model,
@@ -491,6 +512,7 @@ def run_baseline(args):
         "n_loaded_users": len(loaded_users),
         "n_users": len(users),
         "n_turns": len(all_acc),
+        "n_skipped_unlabeled_turns": skipped_unlabeled_turns,
     }
 
     analysis_summary = {
