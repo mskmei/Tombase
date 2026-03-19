@@ -41,11 +41,11 @@ preference_results/
 results/
 outputs/
 *.jsonl
-*.json
+# *.json
 !configs.yaml
 
 # Plots
-*.png
+# *.png
 *.jpg
 *.pdf
 plots/
