@@ -80,9 +80,19 @@ class OpenAIModel(BaseLM):
                     raise
                 time.sleep(cfg.retry_delay)
                 continue
+            
+            # Extract usage information if available
+            result = {"output": output}
+            if hasattr(resp, 'usage') and resp.usage:
+                result["usage"] = {
+                    "prompt_tokens": getattr(resp.usage, 'prompt_tokens', 0),
+                    "completion_tokens": getattr(resp.usage, 'completion_tokens', 0),
+                    "total_tokens": getattr(resp.usage, 'total_tokens', 0)
+                }
+            
             if cfg.reasoning_summary:
-                return {"output": output, "reasoning": resp.output[0].summary[0].text}
-            return {"output": output}
+                result["reasoning"] = resp.output[0].summary[0].text
+            return result
     
     async def async_generate(self, prompts: list[str], schema: Optional[type[BaseModel]] = None, cfg: Optional[GenerationConfig] = None, concurrency: int = 5, return_exceptions: bool = True, **overrides) -> list[Union[Dict[str, str], Exception]]:
         cfg = self._resolve_cfg(cfg, overrides)

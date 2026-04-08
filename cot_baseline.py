@@ -267,6 +267,44 @@ def build_model(
     raise ValueError(f"Unsupported backend: {backend}")
 
 
+def calculate_cost(usage: Dict[str, int], reasoning_model: str, scoring_model: str) -> float:
+    """
+    Calculate cost in USD based on token usage and model pricing.
+    
+    Pricing (per 1M tokens):
+    - GPT-5.4-nano: $0.20 input, $1.25 output
+    - GPT-5: (Add pricing if different)
+    """
+    # Model pricing (per 1M tokens)
+    PRICING = {
+        "gpt-5.4-nano": {"input": 0.20, "output": 1.25},
+        "gpt-5": {"input": 1.25, "output": 10},  # Estimated, adjust as needed
+        "default": {"input": 0.20, "output": 1.25}
+    }
+    
+    def get_price(model_name: str):
+        model_lower = model_name.lower()
+        for key in PRICING:
+            if key in model_lower:
+                return PRICING[key]
+        return PRICING["default"]
+    
+    reasoning_price = get_price(reasoning_model)
+    scoring_price = get_price(scoring_model)
+    
+    # Calculate cost
+    reasoning_cost = (
+        usage["reasoning_input"] * reasoning_price["input"] / 1_000_000 +
+        usage["reasoning_output"] * reasoning_price["output"] / 1_000_000
+    )
+    scoring_cost = (
+        usage["scoring_input"] * scoring_price["input"] / 1_000_000 +
+        usage["scoring_output"] * scoring_price["output"] / 1_000_000
+    )
+    
+    return reasoning_cost + scoring_cost
+
+
 def predict_ranking_and_metrics(
     reasoning_model,
     scoring_model,
@@ -297,9 +335,17 @@ def predict_ranking_and_metrics(
     retries = 0
     n_candidates = len(current_turn.candidates)
     last_exc = None
+    usage_stats = {"reasoning_input": 0, "reasoning_output": 0, "scoring_input": 0, "scoring_output": 0}
+    
     while True:
         try:
-            output = reasoning_model.generate(prompt, cfg=reasoning_cfg)["output"]
+            result = reasoning_model.generate(prompt, cfg=reasoning_cfg)
+            output = result["output"]
+            # Track token usage
+            if "usage" in result:
+                usage_stats["reasoning_input"] += result["usage"].get("prompt_tokens", 0)
+                usage_stats["reasoning_output"] += result["usage"].get("completion_tokens", 0)
+            
             ranking_json = _extract_json(output)
             ranking = _normalize_ranking(ranking_json.get("ranking"), n_candidates=n_candidates)
             break
@@ -334,6 +380,7 @@ def predict_ranking_and_metrics(
                         "actual_idx": resolved_chosen_idx,
                         "parse_failed": True,
                         "error": str(last_exc),
+                        "usage": usage_stats,
                     }
                 raise ValueError(
                     f"Failed to get valid ranking after {reasoning_cfg.max_retries} retries: {last_exc}"
@@ -349,7 +396,13 @@ def predict_ranking_and_metrics(
     eval_prompt = EVALUATE_PROMPT.format(
         current_turn=current_turn.format(include_candidates=True, include_choice=False),
         c=n_candidates,
-        adapted=adapted_response,
+        adapresult = scoring_model.generate(eval_prompt, cfg=score_cfg)
+            score_output = result["output"]
+            # Track token usage
+            if "usage" in result:
+                usage_stats["scoring_input"] += result["usage"].get("prompt_tokens", 0)
+                usage_stats["scoring_output"] += result["usage"].get("completion_tokens", 0)
+            
     )
 
     eval_retries = 0
@@ -381,6 +434,7 @@ def predict_ranking_and_metrics(
         )
     except Exception as exc:
         print(f"[WARN] Embedding similarity computation failed: {exc}")
+        "usage": usage_stats,
         similarity_score = 0.0
         relative_similarity_score_val = 0.0
 
@@ -513,6 +567,11 @@ def run_baseline(args):
     loaded_users = load_data(args.dataset, n_users=args.n_users, seed=args.seed)
     users = loaded_users[: args.users_per_run] if args.users_per_run is not None else loaded_users
 
+    # Track token usage
+    total_usage = {"reasoning_input": 0, "reasoning_output": 0, "scoring_input": 0, "scoring_output": 0}
+    per_user_usage = []
+    
+    
     # Pre-compute total evaluable turns for simple progress reporting.
     total_turns_planned = 0
     for user in users:
@@ -521,7 +580,8 @@ def run_baseline(args):
                 if _resolve_chosen_idx(turn) >= 0:
                     total_turns_planned += 1
 
-    all_acc, all_rank, all_gen, all_rel, all_sim, all_rel_sim = [], [], [], [], [], []
+    all_user_usage = {"reasoning_input": 0, "reasoning_output": 0, "scoring_input": 0, "scoring_output": 0}
+        acc, all_rank, all_gen, all_rel, all_sim, all_rel_sim = [], [], [], [], [], []
     skipped_unlabeled_turns = 0
     processed_turns = 0
     completed_users = 0
@@ -546,6 +606,12 @@ def run_baseline(args):
                 resolved_chosen_idx = _resolve_chosen_idx(turn)
                 if resolved_chosen_idx < 0:
                     skipped_unlabeled_turns += 1
+                
+                # Accumulate usage
+                if "usage" in metrics:
+                    for key in ["reasoning_input", "reasoning_output", "scoring_input", "scoring_output"]:
+                        user_usage[key] += metrics["usage"].get(key, 0)
+                        total_usage[key] += metrics["usage"].get(key, 0)
                     continue
                 if resolved_chosen_idx != turn.chosen_idx:
                     turn.chosen_idx = resolved_chosen_idx
@@ -570,6 +636,15 @@ def run_baseline(args):
                 if processed_turns % 10 == 0 or processed_turns == total_turns_planned:
                     pct = (100.0 * processed_turns / total_turns_planned) if total_turns_planned else 100.0
                     print(
+        
+        # Calculate cost for this user
+        user_cost = calculate_cost(user_usage, args.reasoning_model, args.score_model)
+        per_user_usage.append({
+            "user_id": user.user_id,
+            "usage": user_usage,
+            "cost_usd": user_cost
+        })
+        
                         f"[Progress] Turns {processed_turns}/{total_turns_planned} "
                         f"({pct:.1f}%), skipped_unlabeled={skipped_unlabeled_turns}"
                     )
@@ -608,6 +683,22 @@ def run_baseline(args):
         "n_turns": len(all_acc),
         "n_skipped_unlabeled_turns": skipped_unlabeled_turns,
     }
+    
+    # Calculate total cost
+    total_cost = calculate_cost(total_usage, args.reasoning_model, args.score_model)
+    average_cost_per_user = total_cost / len(users) if users else 0.0
+    
+    cost_summary = {
+        "total_usage": total_usage,
+        "total_cost_usd": total_cost,
+        "average_cost_per_user_usd": average_cost_per_user,
+        "per_user_usage": per_user_usage,
+        "pricing_info": {
+            "reasoning_model": args.reasoning_model,
+            "scoring_model": args.score_model,
+            "note": "GPT-5.4-nano: $0.20/1M input, $1.25/1M output tokens"
+        }
+    }
 
     analysis_summary = {
         "turn_accuracy": aggregate_per_turn(per_turn_acc),
@@ -619,19 +710,27 @@ def run_baseline(args):
     }
 
     # Per-turn aggregation across all users
-    full_turn_stats, max_turn_index, n_users = aggregate_per_turn_full_length_users(results)
-    analysis_summary["turn_trend_all_users"] = {
-        "max_turn_index": max_turn_index,
-        "max_turn": max_turn_index + 1 if max_turn_index >= 0 else 0,
-        "n_users": n_users,
-        "per_turn": full_turn_stats,
-    }
+    cost_path = os.path.join(run_dir, "cost_report.json")
+    trend_plot_path = os.path.join(run_dir, "turn_metric_trends.png")
 
+    with open(results_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    with open(analysis_path, "w", encoding="utf-8") as f:
+        json.dump(analysis_summary, f, indent=2, ensure_ascii=False)
+    with open(cost_path, "w", encoding="utf-8") as f:
+        json.dump(cost
     summary = {"overall": overall, "avg_per_turn": analysis_summary}
 
-    run_dir = os.path.join(args.output_dir, args.run_id)
-    os.makedirs(run_dir, exist_ok=True)
-
+    run_di"\n=== Cost Summary ===")
+    print(f"Total cost: ${total_cost:.4f} USD")
+    print(f"Average cost per user: ${average_cost_per_user:.4f} USD")
+    print(f"Total tokens: {total_usage['reasoning_input'] + total_usage['reasoning_output'] + total_usage['scoring_input'] + total_usage['scoring_output']:,}")
+    print(f"\nSaved results: {results_path}")
+    print(f"Saved summary: {summary_path}")
+    print(f"Saved per-turn metrics: {analysis_path}")
+    print(f"Saved cost report: {cost
     results_path = os.path.join(run_dir, "results.json")
     summary_path = os.path.join(run_dir, "summary.json")
     analysis_path = os.path.join(run_dir, "analysis_summary.json")
