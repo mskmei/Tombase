@@ -566,6 +566,10 @@ def run_baseline(args):
     loaded_users = load_data(args.dataset, n_users=args.n_users, seed=args.seed)
     users = loaded_users[: args.users_per_run] if args.users_per_run is not None else loaded_users
 
+    # Create output directory
+    run_dir = os.path.join(args.output_dir, args.run_id)
+    os.makedirs(run_dir, exist_ok=True)
+
     # Track token usage
     total_usage = {"reasoning_input": 0, "reasoning_output": 0, "scoring_input": 0, "scoring_output": 0}
     per_user_usage = []
@@ -708,10 +712,16 @@ def run_baseline(args):
         "turn_relative_similarity_score": aggregate_per_turn(per_turn_rel_sim),
     }
 
-    # Per-turn aggregation across all users
+    summary = {"overall": overall, "avg_per_turn": analysis_summary}
+    
+    # Define all output paths
+    results_path = os.path.join(run_dir, "results.json")
+    summary_path = os.path.join(run_dir, "summary.json")
+    analysis_path = os.path.join(run_dir, "analysis_summary.json")
     cost_path = os.path.join(run_dir, "cost_report.json")
     trend_plot_path = os.path.join(run_dir, "turn_metric_trends.png")
 
+    # Write all JSON files
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
     with open(summary_path, "w", encoding="utf-8") as f:
@@ -719,36 +729,30 @@ def run_baseline(args):
     with open(analysis_path, "w", encoding="utf-8") as f:
         json.dump(analysis_summary, f, indent=2, ensure_ascii=False)
     with open(cost_path, "w", encoding="utf-8") as f:
-        json.dump(cost
-    summary = {"overall": overall, "avg_per_turn": analysis_summary}
+        json.dump(cost_summary, f, indent=2, ensure_ascii=False)
 
-    run_di"\n=== Cost Summary ===")
+    # Generate plot (if full_turn_stats exists)
+    full_turn_stats = {
+        "turn_accuracy": per_turn_acc,
+        "turn_ranking_score": per_turn_rank,
+        "turn_generation_score": per_turn_gen,
+        "turn_relative_gpt_score": per_turn_rel,
+        "turn_similarity_score": per_turn_sim,
+        "turn_relative_similarity_score": per_turn_rel_sim,
+    }
+    _plot_turn_trends(full_turn_stats, trend_plot_path)
+
+    # Print summary
+    print("\n=== CoT Baseline Complete ===")
+    print(json.dumps(overall, indent=2))
+    print("\n=== Cost Summary ===")
     print(f"Total cost: ${total_cost:.4f} USD")
     print(f"Average cost per user: ${average_cost_per_user:.4f} USD")
     print(f"Total tokens: {total_usage['reasoning_input'] + total_usage['reasoning_output'] + total_usage['scoring_input'] + total_usage['scoring_output']:,}")
     print(f"\nSaved results: {results_path}")
     print(f"Saved summary: {summary_path}")
     print(f"Saved per-turn metrics: {analysis_path}")
-    print(f"Saved cost report: {cost
-    results_path = os.path.join(run_dir, "results.json")
-    summary_path = os.path.join(run_dir, "summary.json")
-    analysis_path = os.path.join(run_dir, "analysis_summary.json")
-    trend_plot_path = os.path.join(run_dir, "turn_metric_trends.png")
-
-    with open(results_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
-    with open(analysis_path, "w", encoding="utf-8") as f:
-        json.dump(analysis_summary, f, indent=2, ensure_ascii=False)
-
-    _plot_turn_trends(full_turn_stats, trend_plot_path)
-
-    print("=== CoT Baseline Complete ===")
-    print(json.dumps(overall, indent=2))
-    print(f"Saved results: {results_path}")
-    print(f"Saved summary: {summary_path}")
-    print(f"Saved per-turn metrics: {analysis_path}")
+    print(f"Saved cost report: {cost_path}")
     print(f"Saved turn trend plot: {trend_plot_path}")
 
 
