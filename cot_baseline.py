@@ -29,42 +29,42 @@ def _plot_turn_trends(per_turn_stats: Dict[str, Dict[str, float]], output_path: 
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
 
     axes[0, 0].plot(x, acc, marker="o", linewidth=2, color="tab:blue")
-    axes[0, 0].set_title("Accuracy by Turn (Full-Length Users)")
+    axes[0, 0].set_title("Accuracy by Turn")
     axes[0, 0].set_xlabel("Turn")
     axes[0, 0].set_ylabel("Accuracy")
     axes[0, 0].set_ylim(0.0, 1.0)
     axes[0, 0].grid(True, alpha=0.3)
 
     axes[0, 1].plot(x, rank, marker="s", linewidth=2, color="tab:orange")
-    axes[0, 1].set_title("Ranking Score by Turn (Full-Length Users)")
+    axes[0, 1].set_title("Ranking Score by Turn")
     axes[0, 1].set_xlabel("Turn")
     axes[0, 1].set_ylabel("Ranking Score")
     axes[0, 1].set_ylim(0.0, 1.0)
     axes[0, 1].grid(True, alpha=0.3)
 
     axes[0, 2].plot(x, gen, marker="^", linewidth=2, color="tab:green")
-    axes[0, 2].set_title("Generation Score by Turn (Full-Length Users)")
+    axes[0, 2].set_title("Generation Score by Turn")
     axes[0, 2].set_xlabel("Turn")
     axes[0, 2].set_ylabel("GPT Score (0-5)")
     axes[0, 2].set_ylim(0.0, 5.0)
     axes[0, 2].grid(True, alpha=0.3)
 
     axes[1, 0].plot(x, rel_gpt, marker="d", linewidth=2, color="tab:red")
-    axes[1, 0].set_title("Relative GPT Score by Turn (Full-Length Users)")
+    axes[1, 0].set_title("Relative GPT Score by Turn")
     axes[1, 0].set_xlabel("Turn")
     axes[1, 0].set_ylabel("Relative GPT Score")
     axes[1, 0].set_ylim(-5.0, 5.0)
     axes[1, 0].grid(True, alpha=0.3)
 
     axes[1, 1].plot(x, sim, marker="p", linewidth=2, color="tab:purple")
-    axes[1, 1].set_title("Similarity Score by Turn (Full-Length Users)")
+    axes[1, 1].set_title("Similarity Score by Turn")
     axes[1, 1].set_xlabel("Turn")
     axes[1, 1].set_ylabel("Embedding Similarity")
     axes[1, 1].set_ylim(-1.0, 1.0)
     axes[1, 1].grid(True, alpha=0.3)
 
     axes[1, 2].plot(x, rel_sim, marker="h", linewidth=2, color="tab:brown")
-    axes[1, 2].set_title("Relative Similarity Score by Turn (Full-Length Users)")
+    axes[1, 2].set_title("Relative Similarity Score by Turn")
     axes[1, 2].set_xlabel("Turn")
     axes[1, 2].set_ylabel("Relative Similarity")
     axes[1, 2].set_ylim(-2.0, 2.0)
@@ -409,12 +409,13 @@ def aggregate_per_turn(turn_metrics: Dict[int, List[float]]) -> Dict[str, Dict[s
 
 def aggregate_per_turn_full_length_users(results: List[Dict]) -> Tuple[Dict[str, Dict[str, float]], int, int]:
     """
-    Aggregate per-turn metrics using only users that reach the global max turn.
+    Aggregate per-turn metrics across all users by turn position.
+    Users with fewer turns contribute to earlier turn indices only.
 
     Returns:
       per_turn_stats: dict keyed by turn index string
       max_turn_index: global max turn index
-      n_full_length_users: number of users included
+      n_users: total number of users included
     """
     if not results:
         return {}, -1, 0
@@ -425,7 +426,8 @@ def aggregate_per_turn_full_length_users(results: List[Dict]) -> Tuple[Dict[str,
         user_max_turn[user_res["user_id"]] = max(turns) if turns else -1
 
     max_turn_index = max(user_max_turn.values()) if user_max_turn else -1
-    full_users = {uid for uid, mt in user_max_turn.items() if mt == max_turn_index}
+    # Include ALL users instead of filtering to full_length only
+    all_users = set(user_max_turn.keys())
 
     per_turn_acc = defaultdict(list)
     per_turn_rank = defaultdict(list)
@@ -435,8 +437,7 @@ def aggregate_per_turn_full_length_users(results: List[Dict]) -> Tuple[Dict[str,
     per_turn_rel_sim = defaultdict(list)
 
     for user_res in results:
-        if user_res["user_id"] not in full_users:
-            continue
+        # Include all users, not just full_length ones
         for tr in user_res.get("turn_results", []):
             t = tr["turn"]
             per_turn_acc[t].append(tr["accuracy"])
@@ -467,7 +468,7 @@ def aggregate_per_turn_full_length_users(results: List[Dict]) -> Tuple[Dict[str,
         }
 
     return per_turn_stats, max_turn_index, len(full_users)
-
+result
 
 def run_baseline(args):
     random.seed(args.seed)
@@ -619,12 +620,12 @@ def run_baseline(args):
         "turn_relative_similarity_score": aggregate_per_turn(per_turn_rel_sim),
     }
 
-    # Your requested trend view: only users with the longest turn length.
-    full_turn_stats, max_turn_index, n_full_users = aggregate_per_turn_full_length_users(results)
-    analysis_summary["turn_trend_full_length_users"] = {
+    # Per-turn aggregation across all users
+    full_turn_stats, max_turn_index, n_users = aggregate_per_turn_full_length_users(results)
+    analysis_summary["turn_trend_all_users"] = {
         "max_turn_index": max_turn_index,
         "max_turn": max_turn_index + 1 if max_turn_index >= 0 else 0,
-        "n_full_length_users": n_full_users,
+        "n_users": n_users,
         "per_turn": full_turn_stats,
     }
 
@@ -636,7 +637,7 @@ def run_baseline(args):
     results_path = os.path.join(run_dir, "results.json")
     summary_path = os.path.join(run_dir, "summary.json")
     analysis_path = os.path.join(run_dir, "analysis_summary.json")
-    trend_plot_path = os.path.join(run_dir, "turn_metric_trends_full_length_users.png")
+    trend_plot_path = os.path.join(run_dir, "turn_metric_trends.png")
 
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
