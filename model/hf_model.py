@@ -86,7 +86,7 @@ class HFModel(BaseLM):
         except TypeError:
             return self.tokenizer.apply_chat_template(messages, **kwargs)
 
-    def _run_generate(self, prompt: str, max_new_tokens: int) -> str:
+    def _run_generate(self, prompt: str, max_new_tokens: int) -> tuple[str, dict]:
         import torch
 
         text = self._build_prompt_text(prompt)
@@ -102,7 +102,16 @@ class HFModel(BaseLM):
             )
 
         new_tokens = output_ids[0][n_input:]
-        return self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        n_output = len(new_tokens)
+        output_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        
+        # Return output text and usage statistics
+        usage = {
+            "prompt_tokens": n_input,
+            "completion_tokens": n_output,
+            "total_tokens": n_input + n_output
+        }
+        return output_text, usage
 
     def _resolve_max_tokens(
         self, cfg: Optional[GenerationConfig], overrides: dict
@@ -124,8 +133,8 @@ class HFModel(BaseLM):
         **overrides,
     ) -> Dict[str, str]:
         max_new_tokens = self._resolve_max_tokens(cfg, overrides)
-        output = self._run_generate(prompt, max_new_tokens=max_new_tokens)
-        return {"output": output}
+        output, usage = self._run_generate(prompt, max_new_tokens=max_new_tokens)
+        return {"output": output, "usage": usage}
 
     def batch_generate(
         self,

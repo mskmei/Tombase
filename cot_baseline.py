@@ -446,6 +446,7 @@ def predict_ranking_and_metrics(
         "relative_similarity_score": relative_similarity_score_val,
         "predicted_idx": top_choice_idx,
         "actual_idx": resolved_chosen_idx,
+        "usage": usage_stats,
     }
 
 
