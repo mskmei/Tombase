@@ -83,17 +83,31 @@ class OpenAIModel(BaseLM):
             
             # Extract usage information if available
             result = {"output": output}
+            
+            # Debug: Print full response structure
+            print(f"[DEBUG] Response type: {type(resp)}")
+            print(f"[DEBUG] Response dir: {[attr for attr in dir(resp) if not attr.startswith('_')]}")
+            if hasattr(resp, '__dict__'):
+                print(f"[DEBUG] Response __dict__: {resp.__dict__}")
+            
+            # Try different ways to get usage
             if hasattr(resp, 'usage') and resp.usage:
+                print(f"[DEBUG] Found resp.usage: {resp.usage}")
                 result["usage"] = {
                     "prompt_tokens": getattr(resp.usage, 'prompt_tokens', 0),
                     "completion_tokens": getattr(resp.usage, 'completion_tokens', 0),
                     "total_tokens": getattr(resp.usage, 'total_tokens', 0)
                 }
+            elif hasattr(resp, 'input_tokens') or hasattr(resp, 'output_tokens'):
+                # Some APIs use different attribute names
+                print(f"[DEBUG] Using alternative token attributes")
+                result["usage"] = {
+                    "prompt_tokens": getattr(resp, 'input_tokens', 0),
+                    "completion_tokens": getattr(resp, 'output_tokens', 0),
+                    "total_tokens": getattr(resp, 'input_tokens', 0) + getattr(resp, 'output_tokens', 0)
+                }
             else:
-                # Debug: print what attributes resp actually has
-                print(f"[WARN] No usage in response. Response type: {type(resp)}, has usage attr: {hasattr(resp, 'usage')}")
-                if hasattr(resp, '__dict__'):
-                    print(f"[WARN] Response attributes: {list(resp.__dict__.keys())}")
+                print(f"[WARN] No usage information found in response")
             
             if cfg.reasoning_summary:
                 result["reasoning"] = resp.output[0].summary[0].text
