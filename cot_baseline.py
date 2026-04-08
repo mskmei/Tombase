@@ -610,13 +610,8 @@ def run_baseline(args):
                 resolved_chosen_idx = _resolve_chosen_idx(turn)
                 if resolved_chosen_idx < 0:
                     skipped_unlabeled_turns += 1
-                
-                # Accumulate usage
-                if "usage" in metrics:
-                    for key in ["reasoning_input", "reasoning_output", "scoring_input", "scoring_output"]:
-                        user_usage[key] += metrics["usage"].get(key, 0)
-                        total_usage[key] += metrics["usage"].get(key, 0)
                     continue
+                    
                 if resolved_chosen_idx != turn.chosen_idx:
                     turn.chosen_idx = resolved_chosen_idx
 
@@ -632,6 +627,12 @@ def run_baseline(args):
                     max_chars=args.max_chars,
                     ranking_fail_mode=args.ranking_fail_mode,
                 )
+
+                # Accumulate usage
+                if "usage" in metrics:
+                    for key in ["reasoning_input", "reasoning_output", "scoring_input", "scoring_output"]:
+                        user_usage[key] += metrics["usage"].get(key, 0)
+                        total_usage[key] += metrics["usage"].get(key, 0)
 
                 user_result["turn_results"].append({"turn": global_turn_index, **metrics})
                 global_turn_index += 1  # Increment global turn index
