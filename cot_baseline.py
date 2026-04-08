@@ -468,7 +468,6 @@ def aggregate_per_turn_full_length_users(results: List[Dict]) -> Tuple[Dict[str,
         }
 
     return per_turn_stats, max_turn_index, len(full_users)
-result
 
 def run_baseline(args):
     random.seed(args.seed)
