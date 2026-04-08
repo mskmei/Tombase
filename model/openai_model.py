@@ -84,27 +84,12 @@ class OpenAIModel(BaseLM):
             # Extract usage information if available
             result = {"output": output}
             
-            # Debug: Print full response structure
-            print(f"[DEBUG] Response type: {type(resp)}")
-            print(f"[DEBUG] Response dir: {[attr for attr in dir(resp) if not attr.startswith('_')]}")
-            if hasattr(resp, '__dict__'):
-                print(f"[DEBUG] Response __dict__: {resp.__dict__}")
-            
-            # Try different ways to get usage
             if hasattr(resp, 'usage') and resp.usage:
-                print(f"[DEBUG] Found resp.usage: {resp.usage}")
+                # OpenAI Responses API uses input_tokens/output_tokens
                 result["usage"] = {
-                    "prompt_tokens": getattr(resp.usage, 'prompt_tokens', 0),
-                    "completion_tokens": getattr(resp.usage, 'completion_tokens', 0),
+                    "prompt_tokens": getattr(resp.usage, 'input_tokens', 0),
+                    "completion_tokens": getattr(resp.usage, 'output_tokens', 0),
                     "total_tokens": getattr(resp.usage, 'total_tokens', 0)
-                }
-            elif hasattr(resp, 'input_tokens') or hasattr(resp, 'output_tokens'):
-                # Some APIs use different attribute names
-                print(f"[DEBUG] Using alternative token attributes")
-                result["usage"] = {
-                    "prompt_tokens": getattr(resp, 'input_tokens', 0),
-                    "completion_tokens": getattr(resp, 'output_tokens', 0),
-                    "total_tokens": getattr(resp, 'input_tokens', 0) + getattr(resp, 'output_tokens', 0)
                 }
             else:
                 print(f"[WARN] No usage information found in response")

@@ -345,8 +345,6 @@ def predict_ranking_and_metrics(
             if "usage" in result:
                 usage_stats["reasoning_input"] += result["usage"].get("prompt_tokens", 0)
                 usage_stats["reasoning_output"] += result["usage"].get("completion_tokens", 0)
-            else:
-                print(f"[WARN] No usage info in reasoning result. Result keys: {result.keys()}")
             
             ranking_json = _extract_json(output)
             ranking = _normalize_ranking(ranking_json.get("ranking"), n_candidates=n_candidates)
@@ -410,8 +408,6 @@ def predict_ranking_and_metrics(
             if "usage" in result:
                 usage_stats["scoring_input"] += result["usage"].get("prompt_tokens", 0)
                 usage_stats["scoring_output"] += result["usage"].get("completion_tokens", 0)
-            else:
-                print(f"[WARN] No usage info in scoring result. Result keys: {result.keys()}")
             
             score_json = _extract_json(score_output)
             scores = score_json["scores"]
