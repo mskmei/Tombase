@@ -8,7 +8,7 @@ from statistics import mean
 from typing import Dict, List, Tuple
 
 from data import Turn, load_data
-from model import GenerationConfig, HFModel, OpenAIModel
+from model import GenerationConfig, HFModel, OpenAIModel, EmbedConfig, text_similarity, relative_similarity_score
 
 
 def _plot_turn_trends(per_turn_stats: Dict[str, Dict[str, float]], output_path: str):
@@ -22,37 +22,53 @@ def _plot_turn_trends(per_turn_stats: Dict[str, Dict[str, float]], output_path: 
     acc = [per_turn_stats[str(t)]["accuracy"] for t in turns]
     rank = [per_turn_stats[str(t)]["ranking_score"] for t in turns]
     gen = [per_turn_stats[str(t)]["generation_score"] for t in turns]
-    rel = [per_turn_stats[str(t)]["relative_gpt_score"] for t in turns]
+    rel_gpt = [per_turn_stats[str(t)]["relative_gpt_score"] for t in turns]
+    sim = [per_turn_stats[str(t)]["similarity_score"] for t in turns]
+    rel_sim = [per_turn_stats[str(t)]["relative_similarity_score"] for t in turns]
 
-    fig, axes = plt.subplots(1, 4, figsize=(24, 5))
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
 
-    axes[0].plot(x, acc, marker="o", linewidth=2, color="tab:blue")
-    axes[0].set_title("Accuracy by Turn (Full-Length Users)")
-    axes[0].set_xlabel("Turn")
-    axes[0].set_ylabel("Accuracy")
-    axes[0].set_ylim(0.0, 1.0)
-    axes[0].grid(True, alpha=0.3)
+    axes[0, 0].plot(x, acc, marker="o", linewidth=2, color="tab:blue")
+    axes[0, 0].set_title("Accuracy by Turn (Full-Length Users)")
+    axes[0, 0].set_xlabel("Turn")
+    axes[0, 0].set_ylabel("Accuracy")
+    axes[0, 0].set_ylim(0.0, 1.0)
+    axes[0, 0].grid(True, alpha=0.3)
 
-    axes[1].plot(x, rank, marker="s", linewidth=2, color="tab:orange")
-    axes[1].set_title("Ranking Score by Turn (Full-Length Users)")
-    axes[1].set_xlabel("Turn")
-    axes[1].set_ylabel("Ranking Score")
-    axes[1].set_ylim(0.0, 1.0)
-    axes[1].grid(True, alpha=0.3)
+    axes[0, 1].plot(x, rank, marker="s", linewidth=2, color="tab:orange")
+    axes[0, 1].set_title("Ranking Score by Turn (Full-Length Users)")
+    axes[0, 1].set_xlabel("Turn")
+    axes[0, 1].set_ylabel("Ranking Score")
+    axes[0, 1].set_ylim(0.0, 1.0)
+    axes[0, 1].grid(True, alpha=0.3)
 
-    axes[2].plot(x, gen, marker="^", linewidth=2, color="tab:green")
-    axes[2].set_title("Generation Score by Turn (Full-Length Users)")
-    axes[2].set_xlabel("Turn")
-    axes[2].set_ylabel("Generation Score")
-    axes[2].set_ylim(0.0, 5.0)
-    axes[2].grid(True, alpha=0.3)
+    axes[0, 2].plot(x, gen, marker="^", linewidth=2, color="tab:green")
+    axes[0, 2].set_title("Generation Score by Turn (Full-Length Users)")
+    axes[0, 2].set_xlabel("Turn")
+    axes[0, 2].set_ylabel("GPT Score (0-5)")
+    axes[0, 2].set_ylim(0.0, 5.0)
+    axes[0, 2].grid(True, alpha=0.3)
 
-    axes[3].plot(x, rel, marker="d", linewidth=2, color="tab:red")
-    axes[3].set_title("Relative GPT Score by Turn (Full-Length Users)")
-    axes[3].set_xlabel("Turn")
-    axes[3].set_ylabel("Relative GPT Score")
-    axes[3].set_ylim(-5.0, 5.0)
-    axes[3].grid(True, alpha=0.3)
+    axes[1, 0].plot(x, rel_gpt, marker="d", linewidth=2, color="tab:red")
+    axes[1, 0].set_title("Relative GPT Score by Turn (Full-Length Users)")
+    axes[1, 0].set_xlabel("Turn")
+    axes[1, 0].set_ylabel("Relative GPT Score")
+    axes[1, 0].set_ylim(-5.0, 5.0)
+    axes[1, 0].grid(True, alpha=0.3)
+
+    axes[1, 1].plot(x, sim, marker="p", linewidth=2, color="tab:purple")
+    axes[1, 1].set_title("Similarity Score by Turn (Full-Length Users)")
+    axes[1, 1].set_xlabel("Turn")
+    axes[1, 1].set_ylabel("Embedding Similarity")
+    axes[1, 1].set_ylim(-1.0, 1.0)
+    axes[1, 1].grid(True, alpha=0.3)
+
+    axes[1, 2].plot(x, rel_sim, marker="h", linewidth=2, color="tab:brown")
+    axes[1, 2].set_title("Relative Similarity Score by Turn (Full-Length Users)")
+    axes[1, 2].set_xlabel("Turn")
+    axes[1, 2].set_ylabel("Relative Similarity")
+    axes[1, 2].set_ylim(-2.0, 2.0)
+    axes[1, 2].grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=220, bbox_inches="tight")
@@ -164,7 +180,7 @@ def _build_history(conversation_history: List[Turn], max_history_turns: int, max
 def _build_candidates(turn: Turn, max_chars: int) -> str:
     lines = []
     for i, c in enumerate(turn.candidates, start=1):
-        lines.append(f"{i}. {_compact_text(c, max_chars)}")
+        lines.append(f"[C{i}]\n{_compact_text(c, max_chars)}\n")
     return "\n".join(lines)
 
 
@@ -257,6 +273,7 @@ def predict_ranking_and_metrics(
     conversation_history: List[Turn],
     reasoning_cfg: GenerationConfig,
     score_cfg: GenerationConfig,
+    embed_cfg: EmbedConfig,
     max_history_turns: int,
     max_chars: int,
     ranking_fail_mode: str = "fallback",
@@ -345,11 +362,24 @@ def predict_ranking_and_metrics(
             if eval_retries > score_cfg.max_retries:
                 raise ValueError(f"Failed to get valid generation score after {score_cfg.max_retries} retries: {exc}")
 
+    # Compute embedding-based similarity metrics
+    try:
+        similarity_score = text_similarity(adapted_response, current_turn.chosen, embed_cfg)
+        relative_similarity_score_val = relative_similarity_score(
+            adapted_response, current_turn.candidates, resolved_chosen_idx, embed_cfg
+        )
+    except Exception as exc:
+        print(f"[WARN] Embedding similarity computation failed: {exc}")
+        similarity_score = 0.0
+        relative_similarity_score_val = 0.0
+
     return {
         "accuracy": accuracy,
         "ranking_score": ranking_score,
         "generation_score": generation_score,
         "relative_gpt_score": relative_gpt_score,
+        "similarity_score": similarity_score,
+        "relative_similarity_score": relative_similarity_score_val,
         "predicted_idx": top_choice_idx,
         "actual_idx": resolved_chosen_idx,
     }
@@ -390,6 +420,8 @@ def aggregate_per_turn_full_length_users(results: List[Dict]) -> Tuple[Dict[str,
     per_turn_rank = defaultdict(list)
     per_turn_gen = defaultdict(list)
     per_turn_rel = defaultdict(list)
+    per_turn_sim = defaultdict(list)
+    per_turn_rel_sim = defaultdict(list)
 
     for user_res in results:
         if user_res["user_id"] not in full_users:
@@ -400,6 +432,8 @@ def aggregate_per_turn_full_length_users(results: List[Dict]) -> Tuple[Dict[str,
             per_turn_rank[t].append(tr["ranking_score"])
             per_turn_gen[t].append(tr["generation_score"])
             per_turn_rel[t].append(tr["relative_gpt_score"])
+            per_turn_sim[t].append(tr["similarity_score"])
+            per_turn_rel_sim[t].append(tr["relative_similarity_score"])
 
     per_turn_stats = {}
     for t in range(max_turn_index + 1):
@@ -407,6 +441,8 @@ def aggregate_per_turn_full_length_users(results: List[Dict]) -> Tuple[Dict[str,
         rank_vals = per_turn_rank.get(t, [])
         gen_vals = per_turn_gen.get(t, [])
         rel_vals = per_turn_rel.get(t, [])
+        sim_vals = per_turn_sim.get(t, [])
+        rel_sim_vals = per_turn_rel_sim.get(t, [])
         if not acc_vals or not rank_vals or not gen_vals or not rel_vals:
             continue
         per_turn_stats[str(t)] = {
@@ -414,6 +450,8 @@ def aggregate_per_turn_full_length_users(results: List[Dict]) -> Tuple[Dict[str,
             "ranking_score": mean(rank_vals),
             "generation_score": mean(gen_vals),
             "relative_gpt_score": mean(rel_vals),
+            "similarity_score": mean(sim_vals) if sim_vals else 0.0,
+            "relative_similarity_score": mean(rel_sim_vals) if rel_sim_vals else 0.0,
             "count": len(acc_vals),
         }
 
@@ -455,6 +493,13 @@ def run_baseline(args):
         reasoning_effort=args.score_reasoning_effort,
     )
 
+    embed_cfg = EmbedConfig(
+        backend="openai",
+        model=args.embed_model,
+        api_key=args.score_api_key,  # Use same API key as scoring model
+        base_url=args.score_base_url,
+    )
+
     loaded_users = load_data(args.dataset, n_users=args.n_users, seed=args.seed)
     users = loaded_users[: args.users_per_run] if args.users_per_run is not None else loaded_users
 
@@ -466,7 +511,7 @@ def run_baseline(args):
                 if _resolve_chosen_idx(turn) >= 0:
                     total_turns_planned += 1
 
-    all_acc, all_rank, all_gen, all_rel = [], [], [], []
+    all_acc, all_rank, all_gen, all_rel, all_sim, all_rel_sim = [], [], [], [], [], []
     skipped_unlabeled_turns = 0
     processed_turns = 0
     completed_users = 0
@@ -474,6 +519,8 @@ def run_baseline(args):
     per_turn_rank = defaultdict(list)
     per_turn_gen = defaultdict(list)
     per_turn_rel = defaultdict(list)
+    per_turn_sim = defaultdict(list)
+    per_turn_rel_sim = defaultdict(list)
     results = []
 
     for user in users:
@@ -482,9 +529,10 @@ def run_baseline(args):
             f"Processed turns: {processed_turns}/{total_turns_planned}."
         )
         user_result = {"user_id": user.user_id, "turn_results": []}
+        global_turn_index = 0  # Global turn index across all conversations for this user
         for conv in user.conversations:
             conversation_history: List[Turn] = []
-            for ti, turn in enumerate(conv.turns):
+            for turn in conv.turns:
                 resolved_chosen_idx = _resolve_chosen_idx(turn)
                 if resolved_chosen_idx < 0:
                     skipped_unlabeled_turns += 1
@@ -499,12 +547,14 @@ def run_baseline(args):
                     conversation_history=conversation_history,
                     reasoning_cfg=reasoning_cfg,
                     score_cfg=score_cfg,
+                    embed_cfg=embed_cfg,
                     max_history_turns=args.max_history_turns,
                     max_chars=args.max_chars,
                     ranking_fail_mode=args.ranking_fail_mode,
                 )
 
-                user_result["turn_results"].append({"turn": ti, **metrics})
+                user_result["turn_results"].append({"turn": global_turn_index, **metrics})
+                global_turn_index += 1  # Increment global turn index
 
                 processed_turns += 1
                 if processed_turns % 10 == 0 or processed_turns == total_turns_planned:
@@ -518,11 +568,15 @@ def run_baseline(args):
                 all_rank.append(metrics["ranking_score"])
                 all_gen.append(metrics["generation_score"])
                 all_rel.append(metrics["relative_gpt_score"])
+                all_sim.append(metrics["similarity_score"])
+                all_rel_sim.append(metrics["relative_similarity_score"])
 
-                per_turn_acc[ti].append(metrics["accuracy"])
-                per_turn_rank[ti].append(metrics["ranking_score"])
-                per_turn_gen[ti].append(metrics["generation_score"])
-                per_turn_rel[ti].append(metrics["relative_gpt_score"])
+                per_turn_acc[global_turn_index - 1].append(metrics["accuracy"])
+                per_turn_rank[global_turn_index - 1].append(metrics["ranking_score"])
+                per_turn_gen[global_turn_index - 1].append(metrics["generation_score"])
+                per_turn_rel[global_turn_index - 1].append(metrics["relative_gpt_score"])
+                per_turn_sim[global_turn_index - 1].append(metrics["similarity_score"])
+                per_turn_rel_sim[global_turn_index - 1].append(metrics["relative_similarity_score"])
 
         results.append(user_result)
         completed_users += 1
@@ -537,6 +591,8 @@ def run_baseline(args):
         "ranking_score": mean(all_rank) if all_rank else 0.0,
         "generation_score": mean(all_gen) if all_gen else 0.0,
         "relative_gpt_score": mean(all_rel) if all_rel else 0.0,
+        "similarity_score": mean(all_sim) if all_sim else 0.0,
+        "relative_similarity_score": mean(all_rel_sim) if all_rel_sim else 0.0,
         "n_loaded_users": len(loaded_users),
         "n_users": len(users),
         "n_turns": len(all_acc),
@@ -548,6 +604,8 @@ def run_baseline(args):
         "turn_ranking_score": aggregate_per_turn(per_turn_rank),
         "turn_generation_score": aggregate_per_turn(per_turn_gen),
         "turn_relative_gpt_score": aggregate_per_turn(per_turn_rel),
+        "turn_similarity_score": aggregate_per_turn(per_turn_sim),
+        "turn_relative_similarity_score": aggregate_per_turn(per_turn_rel_sim),
     }
 
     # Your requested trend view: only users with the longest turn length.
@@ -606,6 +664,8 @@ def parse_args():
     parser.add_argument("--score-api-key", type=str, default=None)
     parser.add_argument("--score-max-tokens", type=int, default=256)
     parser.add_argument("--score-reasoning-effort", type=str, default="minimal")
+
+    parser.add_argument("--embed-model", type=str, default="text-embedding-3-small", help="Embedding model for similarity metrics")
 
     parser.add_argument("--max-history-turns", type=int, default=3)
     parser.add_argument("--max-chars", type=int, default=280)
