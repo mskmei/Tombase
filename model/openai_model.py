@@ -89,6 +89,11 @@ class OpenAIModel(BaseLM):
                     "completion_tokens": getattr(resp.usage, 'completion_tokens', 0),
                     "total_tokens": getattr(resp.usage, 'total_tokens', 0)
                 }
+            else:
+                # Debug: print what attributes resp actually has
+                print(f"[WARN] No usage in response. Response type: {type(resp)}, has usage attr: {hasattr(resp, 'usage')}")
+                if hasattr(resp, '__dict__'):
+                    print(f"[WARN] Response attributes: {list(resp.__dict__.keys())}")
             
             if cfg.reasoning_summary:
                 result["reasoning"] = resp.output[0].summary[0].text
