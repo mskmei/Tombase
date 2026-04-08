@@ -580,7 +580,7 @@ def run_baseline(args):
                     total_turns_planned += 1
 
     all_user_usage = {"reasoning_input": 0, "reasoning_output": 0, "scoring_input": 0, "scoring_output": 0}
-    acc, all_rank, all_gen, all_rel, all_sim, all_rel_sim = [], [], [], [], [], []
+    all_acc, all_rank, all_gen, all_rel, all_sim, all_rel_sim = [], [], [], [], [], []
     skipped_unlabeled_turns = 0
     processed_turns = 0
     completed_users = 0
@@ -598,6 +598,7 @@ def run_baseline(args):
             f"Processed turns: {processed_turns}/{total_turns_planned}."
         )
         user_result = {"user_id": user.user_id, "turn_results": []}
+        user_usage = {"reasoning_input": 0, "reasoning_output": 0, "scoring_input": 0, "scoring_output": 0}
         global_turn_index = 0  # Global turn index across all conversations for this user
         for conv in user.conversations:
             conversation_history: List[Turn] = []
@@ -635,15 +636,6 @@ def run_baseline(args):
                 if processed_turns % 10 == 0 or processed_turns == total_turns_planned:
                     pct = (100.0 * processed_turns / total_turns_planned) if total_turns_planned else 100.0
                     print(
-        
-        # Calculate cost for this user
-        user_cost = calculate_cost(user_usage, args.reasoning_model, args.score_model)
-        per_user_usage.append({
-            "user_id": user.user_id,
-            "usage": user_usage,
-            "cost_usd": user_cost
-        })
-        
                         f"[Progress] Turns {processed_turns}/{total_turns_planned} "
                         f"({pct:.1f}%), skipped_unlabeled={skipped_unlabeled_turns}"
                     )
@@ -662,6 +654,14 @@ def run_baseline(args):
                 per_turn_sim[global_turn_index - 1].append(metrics["similarity_score"])
                 per_turn_rel_sim[global_turn_index - 1].append(metrics["relative_similarity_score"])
 
+        # Calculate cost for this user
+        user_cost = calculate_cost(user_usage, args.reasoning_model, args.score_model)
+        per_user_usage.append({
+            "user_id": user.user_id,
+            "usage": user_usage,
+            "cost_usd": user_cost
+        })
+        
         results.append(user_result)
         completed_users += 1
         print(
