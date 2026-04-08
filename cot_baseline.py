@@ -319,11 +319,22 @@ def predict_ranking_and_metrics(
             retries += 1
             if retries > reasoning_cfg.max_retries:
                 if ranking_fail_mode == "fallback":
+                    # Use preference-tracing's approach: return neutral scores instead of default ranking
                     print(
-                        f"[WARN] Ranking parse failed after retries; fallback ranking used. Last error: {last_exc}"
+                        f"[WARN] Ranking parse failed after retries; returning neutral scores. Last error: {last_exc}"
                     )
-                    ranking = list(range(1, n_candidates + 1))
-                    break
+                    return {
+                        "accuracy": 0.0,
+                        "ranking_score": 0.5,  # Neutral score (expected value of random guess)
+                        "generation_score": 2.5,  # Midpoint of 0-5 scale
+                        "relative_gpt_score": 0.0,
+                        "similarity_score": 0.0,
+                        "relative_similarity_score": 0.0,
+                        "predicted_idx": -1,
+                        "actual_idx": resolved_chosen_idx,
+                        "parse_failed": True,
+                        "error": str(last_exc),
+                    }
                 raise ValueError(
                     f"Failed to get valid ranking after {reasoning_cfg.max_retries} retries: {last_exc}"
                 )
