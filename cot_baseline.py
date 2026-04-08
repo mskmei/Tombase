@@ -427,7 +427,6 @@ def aggregate_per_turn_full_length_users(results: List[Dict]) -> Tuple[Dict[str,
 
     max_turn_index = max(user_max_turn.values()) if user_max_turn else -1
     # Include ALL users instead of filtering to full_length only
-    all_users = set(user_max_turn.keys())
 
     per_turn_acc = defaultdict(list)
     per_turn_rank = defaultdict(list)
