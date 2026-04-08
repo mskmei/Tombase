@@ -580,7 +580,7 @@ def run_baseline(args):
                     total_turns_planned += 1
 
     all_user_usage = {"reasoning_input": 0, "reasoning_output": 0, "scoring_input": 0, "scoring_output": 0}
-        acc, all_rank, all_gen, all_rel, all_sim, all_rel_sim = [], [], [], [], [], []
+    acc, all_rank, all_gen, all_rel, all_sim, all_rel_sim = [], [], [], [], [], []
     skipped_unlabeled_turns = 0
     processed_turns = 0
     completed_users = 0
