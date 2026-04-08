@@ -732,16 +732,33 @@ def run_baseline(args):
     with open(cost_path, "w", encoding="utf-8") as f:
         json.dump(cost_summary, f, indent=2, ensure_ascii=False)
 
-    # Generate plot (if full_turn_stats exists)
-    full_turn_stats = {
-        "turn_accuracy": per_turn_acc,
-        "turn_ranking_score": per_turn_rank,
-        "turn_generation_score": per_turn_gen,
-        "turn_relative_gpt_score": per_turn_rel,
-        "turn_similarity_score": per_turn_sim,
-        "turn_relative_similarity_score": per_turn_rel_sim,
-    }
-    _plot_turn_trends(full_turn_stats, trend_plot_path)
+    # Generate plot - reorganize per-turn data for plotting
+    plot_data = {}
+    all_turn_indices = set()
+    for turn_idx in per_turn_acc.keys():
+        all_turn_indices.add(turn_idx)
+    for turn_idx in per_turn_rank.keys():
+        all_turn_indices.add(turn_idx)
+    for turn_idx in per_turn_gen.keys():
+        all_turn_indices.add(turn_idx)
+    for turn_idx in per_turn_rel.keys():
+        all_turn_indices.add(turn_idx)
+    for turn_idx in per_turn_sim.keys():
+        all_turn_indices.add(turn_idx)
+    for turn_idx in per_turn_rel_sim.keys():
+        all_turn_indices.add(turn_idx)
+    
+    for turn_idx in sorted(all_turn_indices):
+        plot_data[str(turn_idx)] = {
+            "accuracy": mean(per_turn_acc[turn_idx]) if per_turn_acc[turn_idx] else 0.0,
+            "ranking_score": mean(per_turn_rank[turn_idx]) if per_turn_rank[turn_idx] else 0.0,
+            "generation_score": mean(per_turn_gen[turn_idx]) if per_turn_gen[turn_idx] else 0.0,
+            "relative_gpt_score": mean(per_turn_rel[turn_idx]) if per_turn_rel[turn_idx] else 0.0,
+            "similarity_score": mean(per_turn_sim[turn_idx]) if per_turn_sim[turn_idx] else 0.0,
+            "relative_similarity_score": mean(per_turn_rel_sim[turn_idx]) if per_turn_rel_sim[turn_idx] else 0.0,
+        }
+    
+    _plot_turn_trends(plot_data, trend_plot_path)
 
     # Print summary
     print("\n=== CoT Baseline Complete ===")
