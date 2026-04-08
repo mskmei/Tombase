@@ -396,19 +396,19 @@ def predict_ranking_and_metrics(
     eval_prompt = EVALUATE_PROMPT.format(
         current_turn=current_turn.format(include_candidates=True, include_choice=False),
         c=n_candidates,
-        adapresult = scoring_model.generate(eval_prompt, cfg=score_cfg)
+        adapted=adapted_response,
+    )
+
+    eval_retries = 0
+    while True:
+        try:
+            result = scoring_model.generate(eval_prompt, cfg=score_cfg)
             score_output = result["output"]
             # Track token usage
             if "usage" in result:
                 usage_stats["scoring_input"] += result["usage"].get("prompt_tokens", 0)
                 usage_stats["scoring_output"] += result["usage"].get("completion_tokens", 0)
             
-    )
-
-    eval_retries = 0
-    while True:
-        try:
-            score_output = scoring_model.generate(eval_prompt, cfg=score_cfg)["output"]
             score_json = _extract_json(score_output)
             scores = score_json["scores"]
             if not isinstance(scores, list) or len(scores) != n_candidates:
@@ -434,7 +434,6 @@ def predict_ranking_and_metrics(
         )
     except Exception as exc:
         print(f"[WARN] Embedding similarity computation failed: {exc}")
-        "usage": usage_stats,
         similarity_score = 0.0
         relative_similarity_score_val = 0.0
 
