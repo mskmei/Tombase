@@ -271,17 +271,22 @@ class ChatModel(BaseLM):
 
     def _build_kwargs(self, prompt: str, cfg: GenerationConfig) -> dict:
         model = cfg.model or self.model
+        effort = cfg.reasoning_effort
+        is_reasoning = effort and effort != "none"
+        max_tokens = cfg.max_tokens + (CHAT_REASONING_BUDGETS.get(effort, 1024) if is_reasoning else 0)
         kwargs: dict = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": cfg.max_tokens,
+            "max_tokens": max_tokens,
         }
-        effort = cfg.reasoning_effort
-        if effort and effort != "none":
-            kwargs["reasoning"] = {"effort": effort}
-            kwargs["max_tokens"] = cfg.max_tokens + CHAT_REASONING_BUDGETS.get(effort, 1024)
+        extra_body: dict = {}
+        if is_reasoning:
+            # OpenRouter requires reasoning in extra_body, not as top-level kwarg
+            extra_body["reasoning"] = {"effort": effort}
         else:
             kwargs["temperature"] = cfg.temperature
+        if extra_body:
+            kwargs["extra_body"] = extra_body
         return kwargs
 
     def generate(
