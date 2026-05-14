@@ -243,3 +243,118 @@ class OpenAIModel(BaseLM):
         )
         batch_obj = self.poll_batch_until_done(batch_id, poll_interval=cfg.poll_interval, timeout=cfg.timeout)
         return self.fetch_batch_outputs(batch_obj)
+
+
+CHAT_REASONING_BUDGETS = {"none": 0, "minimal": 1024, "low": 2048, "medium": 4096, "high": 8192}
+
+
+class ChatModel(BaseLM):
+    """
+    Model backend that uses the OpenAI Chat Completions API (client.chat.completions.create).
+    Compatible with OpenRouter and any OpenAI-compatible endpoint.
+
+    Default base_url points to OpenRouter.
+    """
+
+    OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        model: str = "openai/gpt-5",
+    ):
+        self.model = model
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY", "empty")
+        self.base_url = base_url or self.OPENROUTER_BASE_URL
+        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+
+    def _build_kwargs(self, prompt: str, cfg: GenerationConfig) -> dict:
+        model = cfg.model or self.model
+        kwargs: dict = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": cfg.max_tokens,
+        }
+        effort = cfg.reasoning_effort
+        if effort and effort != "none":
+            kwargs["reasoning"] = {"effort": effort}
+            kwargs["max_tokens"] = cfg.max_tokens + CHAT_REASONING_BUDGETS.get(effort, 1024)
+        else:
+            kwargs["temperature"] = cfg.temperature
+        return kwargs
+
+    def generate(
+        self,
+        prompt: str,
+        schema=None,
+        cfg: Optional[GenerationConfig] = None,
+        **overrides,
+    ) -> Dict[str, Any]:
+        cfg = cfg or GenerationConfig(model=self.model)
+        if overrides:
+            cfg = replace(cfg, **{k: v for k, v in overrides.items() if hasattr(cfg, k)})
+
+        kwargs = self._build_kwargs(prompt, cfg)
+        for attempt in range(cfg.max_retries):
+            try:
+                resp = self.client.chat.completions.create(**kwargs)
+                output = resp.choices[0].message.content or ""
+                if schema:
+                    parser = Parser(schema)
+                    output = parser.parse(output)
+            except (APIError, RateLimitError, ParseError):
+                if attempt == cfg.max_retries - 1:
+                    raise
+                time.sleep(cfg.retry_delay)
+                continue
+
+            result: Dict[str, Any] = {"output": output}
+            if resp.usage:
+                result["usage"] = {
+                    "prompt_tokens": getattr(resp.usage, "prompt_tokens", 0),
+                    "completion_tokens": getattr(resp.usage, "completion_tokens", 0),
+                    "total_tokens": getattr(resp.usage, "total_tokens", 0),
+                }
+            return result
+
+    async def async_generate(
+        self,
+        prompts: list,
+        schema=None,
+        cfg: Optional[GenerationConfig] = None,
+        concurrency: int = 5,
+        return_exceptions: bool = True,
+        **overrides,
+    ) -> list:
+        from openai import AsyncOpenAI
+        async_client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
+        cfg = cfg or GenerationConfig(model=self.model)
+        if overrides:
+            cfg = replace(cfg, **{k: v for k, v in overrides.items() if hasattr(cfg, k)})
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _one(prompt: str):
+            async with sem:
+                kwargs = self._build_kwargs(prompt, cfg)
+                for attempt in range(cfg.max_retries):
+                    try:
+                        resp = await async_client.chat.completions.create(**kwargs)
+                        output = resp.choices[0].message.content or ""
+                        if schema:
+                            parser = Parser(schema)
+                            output = parser.parse(output)
+                        result = {"output": output}
+                        if resp.usage:
+                            result["usage"] = {
+                                "prompt_tokens": getattr(resp.usage, "prompt_tokens", 0),
+                                "completion_tokens": getattr(resp.usage, "completion_tokens", 0),
+                                "total_tokens": getattr(resp.usage, "total_tokens", 0),
+                            }
+                        return result
+                    except (APIError, RateLimitError, ParseError):
+                        if attempt == cfg.max_retries - 1:
+                            raise
+                        await asyncio.sleep(cfg.retry_delay)
+
+        return await asyncio.gather(*[_one(p) for p in prompts], return_exceptions=return_exceptions)

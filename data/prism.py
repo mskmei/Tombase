@@ -3,7 +3,9 @@ from datasets import load_dataset
 from .base import Turn, Conversation, UserData
 import random
 
-def group_by_turns(conversation_history: List[Dict]) -> List[Turn]:
+MIN_USER_TURNS = 20
+
+def group_by_turns(conversation_history: List[Dict], id_prefix: str = "") -> List[Turn]:
     turns = {}
     for msg in conversation_history:
         turn = msg.get('turn', 0)
@@ -16,7 +18,10 @@ def group_by_turns(conversation_history: List[Dict]) -> List[Turn]:
             turns[turn].candidates.append(msg.get('content'))
             if msg.get('if_chosen', False):
                 turns[turn].chosen = msg.get('content')
-    return [turns[i] for i in sorted(turns.keys())]
+    return [
+        turns[i] for i in sorted(turns.keys())
+        if turns[i].user_message != "EMPTY STRING"
+    ]
 
 def extract_profile(survey: dict) -> str:
     key_fields = [
@@ -61,12 +66,10 @@ def load_prism(n_users: int = None, seed: int = None) -> List[UserData]:
 
     survey_data = load_dataset("HannahRoseKirk/prism-alignment", "survey")['train']
     survey_rec = {rec['user_id']: rec for rec in survey_data}
-    
-    if n_users is not None:
-        rng = random.Random(seed)
-        user_order = rng.sample(user_order, n_users)
 
-    users: List[UserData] = []
+    # --- Build all users first, apply MIN_USER_TURNS filter ---
+    all_users: List[UserData] = []
+    skipped_short = 0
     for uid in user_order:
         convs = []
         for conv in user_conversations.get(uid, []):
@@ -77,12 +80,35 @@ def load_prism(n_users: int = None, seed: int = None) -> List[UserData]:
                 conversation_id=cid,
                 turns=turns
             ))
+        total_turns = sum(len(conv.turns) for conv in convs)
+        if total_turns < MIN_USER_TURNS:
+            skipped_short += 1
+            continue
         gt_profile = extract_profile(survey_rec[uid])
-        users.append(UserData(
+        all_users.append(UserData(
             user_id=uid,
             conversations=convs,
             gt_profile=gt_profile
         ))
+
+    print(
+        f"[Data] Total users in dataset: {len(user_order)}  |  "
+        f"Skipped (turns < {MIN_USER_TURNS}): {skipped_short}  |  "
+        f"Eligible users: {len(all_users)}"
+    )
+
+    # --- Sample from eligible users ---
+    if n_users is not None and len(all_users) > n_users:
+        random.seed(seed)
+        users = random.sample(all_users, n_users)
+    else:
+        users = all_users
+
+    print(
+        f"[Data] Requested n_users={n_users}  |  "
+        f"Final selected: {len(users)}  |  "
+        f"Avg turns/user: {sum(sum(len(c.turns) for c in u.conversations) for u in users) / len(users):.1f}"
+    )
     return users
 
 

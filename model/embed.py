@@ -54,12 +54,18 @@ def text_similarity(text1: str, text2: str, embed_cfg: EmbedConfig) -> float:
     return float(np.dot(vec[0], vec[1]).item())
 
 
-def relative_similarity_score(adapted: str, candidates: List[str], chosen_idx: int, embed_cfg: EmbedConfig) -> float:
-    """Compute relative similarity: similarity to chosen minus max similarity to rejected."""
+def candidate_similarity_scores(adapted: str, candidates: List[str], embed_cfg: EmbedConfig) -> List[float]:
+    """Compute cosine similarity between adapted response and each candidate (batch embed)."""
     vec = embed([adapted] + candidates, embed_cfg=embed_cfg)
     adapted_vec = vec[0]
     candidate_vecs = vec[1:]
     similarities = np.dot(candidate_vecs, adapted_vec)
+    return [float(s.item()) for s in similarities]
+
+
+def relative_similarity_score(adapted: str, candidates: List[str], chosen_idx: int, embed_cfg: EmbedConfig) -> float:
+    """Compute relative similarity: similarity to chosen minus max similarity to rejected."""
+    similarities = np.array(candidate_similarity_scores(adapted, candidates, embed_cfg))
     chosen_similarity = similarities[chosen_idx]
     rejected_similarities = np.delete(similarities, chosen_idx)
     return float((chosen_similarity - np.max(rejected_similarities)).item())
