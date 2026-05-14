@@ -358,3 +358,6 @@ class ChatModel(BaseLM):
                         await asyncio.sleep(cfg.retry_delay)
 
         return await asyncio.gather(*[_one(p) for p in prompts], return_exceptions=return_exceptions)
+
+    def batch_generate(self, prompts: list, schema=None, cfg=None, **overrides) -> list:
+        return [self.generate(p, schema=schema, cfg=cfg, **overrides) for p in prompts]
