@@ -625,8 +625,8 @@ def run_baseline(args):
     embed_cfg = EmbedConfig(
         backend="openai",
         model=args.embed_model,
-        api_key=args.score_api_key,
-        base_url=args.score_base_url or "https://api.openai.com/v1",
+        api_key=args.embed_api_key or args.score_api_key,
+        base_url=args.embed_base_url or "https://api.openai.com/v1",
     )
 
     loaded_users = load_data(args.dataset, n_users=args.n_users, seed=args.seed)
@@ -822,6 +822,8 @@ def parse_args():
     parser.add_argument("--score-reasoning-effort", type=str, default="minimal")
 
     parser.add_argument("--embed-model", type=str, default="text-embedding-3-small", help="Embedding model for similarity metrics")
+    parser.add_argument("--embed-api-key", type=str, default=None, help="OpenAI API key for embeddings (defaults to --score-api-key if not set)")
+    parser.add_argument("--embed-base-url", type=str, default=None, help="Base URL for embeddings API (defaults to https://api.openai.com/v1)")
 
     parser.add_argument("--max-history-turns", type=int, default=3)
     parser.add_argument("--max-chars", type=int, default=280)
