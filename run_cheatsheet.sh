@@ -1,0 +1,20 @@
+python cheatsheet_baseline.py \
+  --dataset prism \
+  --n-users 1000 \
+  --users-per-run 100 \
+  --seed 42 \
+  --reasoning-backend openrouter \
+  --reasoning-model openai/gpt-5 \
+  --reasoning-api-key YOUR_OPENROUTER_API_KEY \
+  --reasoning-effort minimal \
+  --reasoning-max-tokens 256 \
+  --score-backend openrouter \
+  --score-model openai/gpt-5 \
+  --score-api-key YOUR_OPENROUTER_API_KEY \
+  --score-reasoning-effort minimal \
+  --embed-model text-embedding-3-small \
+  --embed-api-key YOUR_OPENAI_API_KEY \
+  --max-bullets 3 \
+  --update-max-tokens 512 \
+  --output-dir baseline_results \
+  --run-id cheatsheet_gpt5_openrouter
