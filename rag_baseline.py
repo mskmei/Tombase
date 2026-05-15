@@ -1,0 +1,930 @@
+import argparse
+import json
+import math
+import os
+import random
+import re
+from collections import defaultdict
+from pathlib import Path
+from statistics import mean
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+
+from data import Turn, load_data
+from model import GenerationConfig, HFModel, OpenAIModel, ChatModel, EmbedConfig, embed, candidate_similarity_scores
+
+
+def _write_json(path: Path, data: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def _plot_turn_trends(per_turn_stats: Dict[str, Dict[str, float]], output_path: str):
+    import matplotlib.pyplot as plt
+
+    turns = sorted(int(t) for t in per_turn_stats.keys())
+    if not turns:
+        return
+
+    x = [t + 1 for t in turns]
+    acc = [per_turn_stats[str(t)]["accuracy"] for t in turns]
+    rank = [per_turn_stats[str(t)]["ranking_score"] for t in turns]
+    gen = [per_turn_stats[str(t)]["generation_score"] for t in turns]
+    rel_gpt = [per_turn_stats[str(t)]["relative_gpt_score"] for t in turns]
+    sim = [per_turn_stats[str(t)]["similarity_score"] for t in turns]
+    rel_sim = [per_turn_stats[str(t)]["relative_similarity_score"] for t in turns]
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+
+    axes[0, 0].plot(x, acc, marker="o", linewidth=2, color="tab:blue")
+    axes[0, 0].set_title("Accuracy by Turn")
+    axes[0, 0].set_xlabel("Turn")
+    axes[0, 0].set_ylabel("Accuracy")
+    axes[0, 0].set_ylim(0.0, 1.0)
+    axes[0, 0].grid(True, alpha=0.3)
+
+    axes[0, 1].plot(x, rank, marker="s", linewidth=2, color="tab:orange")
+    axes[0, 1].set_title("Ranking Score by Turn")
+    axes[0, 1].set_xlabel("Turn")
+    axes[0, 1].set_ylabel("Ranking Score")
+    axes[0, 1].set_ylim(0.0, 1.0)
+    axes[0, 1].grid(True, alpha=0.3)
+
+    axes[0, 2].plot(x, gen, marker="^", linewidth=2, color="tab:green")
+    axes[0, 2].set_title("Generation Score by Turn")
+    axes[0, 2].set_xlabel("Turn")
+    axes[0, 2].set_ylabel("GPT Score (0-5)")
+    axes[0, 2].set_ylim(0.0, 5.0)
+    axes[0, 2].grid(True, alpha=0.3)
+
+    axes[1, 0].plot(x, rel_gpt, marker="d", linewidth=2, color="tab:red")
+    axes[1, 0].set_title("Relative GPT Score by Turn")
+    axes[1, 0].set_xlabel("Turn")
+    axes[1, 0].set_ylabel("Relative GPT Score")
+    axes[1, 0].set_ylim(-5.0, 5.0)
+    axes[1, 0].grid(True, alpha=0.3)
+
+    axes[1, 1].plot(x, sim, marker="p", linewidth=2, color="tab:purple")
+    axes[1, 1].set_title("Similarity Score by Turn")
+    axes[1, 1].set_xlabel("Turn")
+    axes[1, 1].set_ylabel("Embedding Similarity")
+    axes[1, 1].set_ylim(-1.0, 1.0)
+    axes[1, 1].grid(True, alpha=0.3)
+
+    axes[1, 2].plot(x, rel_sim, marker="h", linewidth=2, color="tab:brown")
+    axes[1, 2].set_title("Relative Similarity Score by Turn")
+    axes[1, 2].set_xlabel("Turn")
+    axes[1, 2].set_ylabel("Relative Similarity")
+    axes[1, 2].set_ylim(-2.0, 2.0)
+    axes[1, 2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+RAG_RANK_PROMPT = """
+You are selecting the best response for the current user message.
+
+Given:
+- Top-{top_k} most relevant past interactions retrieved from conversation history
+- Current user message
+- Candidate responses with ids
+
+Task:
+1. Reason internally step by step from concrete observable differences.
+2. Rank all candidates from best to worst for this specific turn.
+
+Rules:
+- Use only evidence in the provided retrieved context and candidate texts.
+- Do not speculate about hidden user traits.
+- Do not output chain-of-thought.
+- Output valid JSON only.
+
+Return exactly:
+{{
+  "reason": "Brief 1-2 sentence summary of key differences.",
+  "ranking": [1, 2, 3]
+}}
+
+[Retrieved relevant past interactions]
+{retrieved_memories}
+
+[Current user message]
+{current_message}
+
+[Candidates]
+{candidates}
+"""
+
+
+EVALUATE_PROMPT = """
+You are evaluating the similarity between an Adapted response and a set of candidate responses in the context of the user preferences.
+
+Inputs:
+- Current turn with c candidates
+- Adapted response
+
+Step 1:
+Identify 2-4 preference-relevant dimensions that distinguish the candidates.
+Use short canonical labels (e.g., "values", "information_density", "structure", "actionability", "tone", "framing", "abstraction") (Not exhaustive and do not force-fit).
+
+Step 2:
+Using those dimensions, score how similar the Adapted response is to EACH candidate.
+Scores are 0-5:
+5 = Near-identical on the key dimensions; Adapted matches candidate's stance/style/structure with no meaningful drift.
+4 = Strong match on most key dimensions; minor drift on at most one dimension.
+3 = Partial match; aligns on some key dimensions but differs on others OR ambiguity prevents a clear judgment.
+2 = Weak match; differs on one or more key dimensions in a way that matters.
+1 = Very weak match; mostly reflects the opposite of the candidate on key dimensions.
+0 = Opposes/contradicts the candidate on the key dimensions (clear mismatch).
+
+Output valid, parsable JSON only without any extra commentary:
+{{
+  "dimensions": ["...", "..."],
+  "scores": [s0, s1, ..., s{{c-1}}],
+  "justification": "a brief (1-2 sentences) explanation of the key similarities/differences between the Adapted response and each candidates."
+}}
+
+Rules:
+- scores length MUST equal number of candidates; scores[i] corresponds to candidate i. Do NOT change the candidate order.
+- Use the same dimensions for scoring all candidates.
+
+[Current turn]
+{current_turn}
+
+[Number of candidates]
+c={c}
+
+[Adapted]
+{adapted}
+"""
+
+
+def _collapse_ws(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _compact_text(text: str, max_chars: int) -> str:
+    text = _collapse_ws(text)
+    if len(text) <= max_chars:
+        return text
+    half = max_chars // 2
+    return f"{text[:half]} ... {text[-half:]}"
+
+
+def _build_memory_pool(conversation_history: List[Turn], max_chars: int) -> List[Tuple[Turn, str]]:
+    """
+    Build a retrieval pool from all turns before the current one.
+    Each entry is (turn, text) where text is the user message + chosen response.
+    Only uses past turns, so there is no ground-truth leakage.
+    """
+    past_turns = conversation_history[:-1]
+    pool = []
+    for turn in past_turns:
+        user_part = _compact_text(turn.user_message, max_chars)
+        chosen_part = _compact_text(turn.chosen, max_chars)
+        text = f"User: {user_part}\nChosen: {chosen_part}"
+        pool.append((turn, text))
+    return pool
+
+
+def _retrieve_top_k(
+    query: str,
+    memory_pool: List[Tuple[Turn, str]],
+    embed_cfg: EmbedConfig,
+    top_k: int,
+) -> List[Tuple[Turn, str, float]]:
+    """
+    Retrieve top-k most relevant past interactions by cosine similarity
+    between the current user message and each pool entry text.
+
+    Returns list of (turn, text, score) sorted by descending similarity.
+    """
+    if not memory_pool:
+        return []
+
+    texts = [text for _, text in memory_pool]
+    all_texts = [query] + texts
+    vecs = embed(all_texts, embed_cfg=embed_cfg)
+    query_vec = vecs[0]
+    pool_vecs = vecs[1:]
+
+    scores = np.dot(pool_vecs, query_vec)  # shape (N,)
+    k = min(top_k, len(memory_pool))
+    top_indices = np.argsort(scores)[::-1][:k]
+
+    results = []
+    for idx in top_indices:
+        turn, text = memory_pool[idx]
+        results.append((turn, text, float(scores[idx])))
+    return results
+
+
+def _build_retrieved_context(
+    retrieved: List[Tuple[Turn, str, float]],
+    max_chars: int,
+) -> str:
+    """
+    Format retrieved memories into a string for the prompt.
+    Ordered by relevance (most similar first).
+    """
+    if not retrieved:
+        return "(no relevant past interactions found)"
+    lines = []
+    for rank, (_, text, score) in enumerate(retrieved, start=1):
+        lines.append(f"[Memory-{rank}] (similarity={score:.3f})\n{text}")
+    return "\n\n".join(lines)
+
+
+def _build_candidates(turn: Turn, max_chars: int) -> str:
+    lines = []
+    for i, c in enumerate(turn.candidates, start=1):
+        lines.append(f"[C{i}]\n{_compact_text(c, max_chars)}\n")
+    return "\n".join(lines)
+
+
+def _extract_json(text: str) -> Dict:
+    # Remove visible reasoning tags if model emits them.
+    cleaned = re.sub(r"<think>[\\s\\S]*?</think>", "", text, flags=re.IGNORECASE)
+    if "<think>" in cleaned and "</think>" not in cleaned:
+        cleaned = cleaned.split("<think>", 1)[0]
+
+    # Remove markdown code fences if present.
+    cleaned = cleaned.replace("```json", "").replace("```", "")
+
+    left = cleaned.find("{")
+    right = cleaned.rfind("}")
+    if left == -1 or right == -1 or right < left:
+        raise ValueError(f"No JSON object found in output: {text}")
+    return json.loads(cleaned[left : right + 1])
+
+
+def _repair_ranking_output(
+    reasoning_model,
+    raw_output: str,
+    n_candidates: int,
+    reasoning_cfg: GenerationConfig,
+) -> List[int]:
+    repair_prompt = f"""
+Convert the following model output into valid JSON only.
+
+Requirements:
+- Output exactly one JSON object
+- Include key \"ranking\" as a full permutation of integers 1..{n_candidates}
+- Include key \"reason\" as one short sentence
+- No markdown, no extra text
+
+Text to convert:
+{raw_output}
+"""
+    repaired = reasoning_model.generate(repair_prompt, cfg=reasoning_cfg)["output"]
+    repaired_json = _extract_json(repaired)
+    return _normalize_ranking(repaired_json.get("ranking"), n_candidates=n_candidates)
+
+
+def _normalize_ranking(raw_ranking, n_candidates: int) -> List[int]:
+    if not isinstance(raw_ranking, list):
+        raise ValueError("ranking must be a list")
+    ranking: List[int] = []
+    for item in raw_ranking:
+        if isinstance(item, str):
+            if item.strip().isdigit():
+                ranking.append(int(item.strip()))
+            else:
+                raise ValueError(f"ranking item is not numeric: {item}")
+        elif isinstance(item, int):
+            ranking.append(item)
+        else:
+            raise ValueError(f"ranking item has unsupported type: {type(item)}")
+
+    expected = list(range(1, n_candidates + 1))
+    if sorted(ranking) != expected:
+        raise ValueError(f"ranking must be a permutation of {expected}, got {ranking}")
+    return ranking
+
+
+def _resolve_chosen_idx(turn: Turn) -> int:
+    """Return a valid chosen index when available, otherwise -1."""
+    if 0 <= turn.chosen_idx < len(turn.candidates):
+        return turn.chosen_idx
+    if turn.chosen and turn.chosen in turn.candidates:
+        return turn.candidates.index(turn.chosen)
+    return -1
+
+
+def build_model(
+    backend: str,
+    model_name: str,
+    base_url: str,
+    api_key: str,
+    hf_enable_thinking: bool,
+):
+    if backend == "hf":
+        return HFModel(model_name=model_name, enable_thinking=hf_enable_thinking)
+    if backend == "openai":
+        return OpenAIModel(api_key=api_key, base_url=base_url, model=model_name)
+    if backend == "openrouter":
+        return ChatModel(api_key=api_key, base_url=base_url or ChatModel.OPENROUTER_BASE_URL, model=model_name)
+    raise ValueError(f"Unsupported backend: {backend}")
+
+
+def calculate_cost(usage: Dict[str, int], reasoning_model: str, scoring_model: str) -> float:
+    """Calculate cost in USD based on token usage and model pricing."""
+    PRICING = {
+        "gpt-5.4-nano": {"input": 0.20, "output": 1.25},
+        "gpt-5": {"input": 1.25, "output": 10},
+        "default": {"input": 0.20, "output": 1.25},
+    }
+
+    def get_price(model_name: str):
+        model_lower = model_name.lower()
+        for key in PRICING:
+            if key in model_lower:
+                return PRICING[key]
+        return PRICING["default"]
+
+    reasoning_price = get_price(reasoning_model)
+    scoring_price = get_price(scoring_model)
+
+    reasoning_cost = (
+        usage["reasoning_input"] * reasoning_price["input"] / 1_000_000
+        + usage["reasoning_output"] * reasoning_price["output"] / 1_000_000
+    )
+    scoring_cost = (
+        usage["scoring_input"] * scoring_price["input"] / 1_000_000
+        + usage["scoring_output"] * scoring_price["output"] / 1_000_000
+    )
+    return reasoning_cost + scoring_cost
+
+
+def predict_ranking_and_metrics(
+    reasoning_model,
+    scoring_model,
+    conversation_history: List[Turn],
+    reasoning_cfg: GenerationConfig,
+    score_cfg: GenerationConfig,
+    embed_cfg: EmbedConfig,
+    top_k: int,
+    max_chars: int,
+    ranking_fail_mode: str = "fallback",
+) -> Dict:
+    """
+    RAG variant: retrieves top-k most relevant past turns via embedding similarity
+    instead of using the sequential last-N turns as context.
+
+    Returns a dict with keys:
+      prediction: {success, accuracy, ranking_score, ranking, chosen_idx}
+      adaptation: {success, gpt_score, relative_gpt_score, relative_mean_gpt_score,
+                   gpt_scores, rejected_gpt_scores,
+                   similarity_score, relative_score, relative_mean_score,
+                   similarity_scores, rejected_similarity_scores, chosen_idx}
+      usage: {reasoning_input, reasoning_output, scoring_input, scoring_output}
+    """
+    current_turn = conversation_history[-1]
+    resolved_chosen_idx = _resolve_chosen_idx(current_turn)
+    if resolved_chosen_idx < 0:
+        raise ValueError("Current turn has no valid chosen candidate index.")
+
+    # --- RAG retrieval ---
+    memory_pool = _build_memory_pool(conversation_history, max_chars=max_chars)
+    query = _compact_text(current_turn.user_message, max_chars * 2)
+    retrieved = _retrieve_top_k(query, memory_pool, embed_cfg=embed_cfg, top_k=top_k)
+    retrieved_memories = _build_retrieved_context(retrieved, max_chars=max_chars)
+
+    current_message = _compact_text(current_turn.user_message, max_chars)
+    candidates_text = _build_candidates(current_turn, max_chars=max_chars)
+
+    prompt = RAG_RANK_PROMPT.format(
+        top_k=top_k,
+        retrieved_memories=retrieved_memories,
+        current_message=current_message,
+        candidates=candidates_text,
+    )
+
+    retries = 0
+    n_candidates = len(current_turn.candidates)
+    last_exc = None
+    usage_stats = {"reasoning_input": 0, "reasoning_output": 0, "scoring_input": 0, "scoring_output": 0}
+
+    ranking = None
+    while True:
+        try:
+            result = reasoning_model.generate(prompt, cfg=reasoning_cfg)
+            output = result["output"]
+            if "usage" in result:
+                usage_stats["reasoning_input"] += result["usage"].get("prompt_tokens", 0)
+                usage_stats["reasoning_output"] += result["usage"].get("completion_tokens", 0)
+            ranking_json = _extract_json(output)
+            ranking = _normalize_ranking(ranking_json.get("ranking"), n_candidates=n_candidates)
+            break
+        except Exception as exc:
+            last_exc = exc
+            try:
+                ranking = _repair_ranking_output(
+                    reasoning_model=reasoning_model,
+                    raw_output=output if "output" in locals() else str(exc),
+                    n_candidates=n_candidates,
+                    reasoning_cfg=reasoning_cfg,
+                )
+                break
+            except Exception as repair_exc:
+                last_exc = repair_exc
+            retries += 1
+            if retries > reasoning_cfg.max_retries:
+                if ranking_fail_mode == "fallback":
+                    print(
+                        f"[WARN] Ranking parse failed after retries; returning neutral scores. Last error: {last_exc}"
+                    )
+                    return {
+                        "prediction": {
+                            "success": False,
+                            "accuracy": 0.0,
+                            "ranking_score": 0.5,
+                            "reason": str(last_exc),
+                            "chosen_idx": resolved_chosen_idx,
+                        },
+                        "adaptation": {
+                            "success": False,
+                            "error": "Ranking failed; no adapted response.",
+                            "gpt_score": None,
+                            "relative_gpt_score": None,
+                            "relative_mean_gpt_score": None,
+                            "gpt_scores": [],
+                            "rejected_gpt_scores": [],
+                            "similarity_score": None,
+                            "relative_score": None,
+                            "relative_mean_score": None,
+                            "similarity_scores": [],
+                            "rejected_similarity_scores": [],
+                            "chosen_idx": resolved_chosen_idx,
+                        },
+                        "usage": usage_stats,
+                    }
+                raise ValueError(
+                    f"Failed to get valid ranking after {reasoning_cfg.max_retries} retries: {last_exc}"
+                )
+
+    gt_choice = resolved_chosen_idx + 1
+    rank = ranking.index(gt_choice) + 1
+    ranking_score = 1.0 if len(ranking) == 1 else (len(ranking) - rank) / (len(ranking) - 1)
+    accuracy = 1.0 if rank == 1 else 0.0
+
+    top_choice_idx = ranking[0] - 1
+    adapted_response = current_turn.candidates[top_choice_idx]
+
+    # --- GPT scoring ---
+    eval_prompt = EVALUATE_PROMPT.format(
+        current_turn=current_turn.format(include_candidates=True, include_choice=False),
+        c=n_candidates,
+        adapted=adapted_response,
+    )
+
+    gpt_score = None
+    relative_gpt_score = None
+    relative_mean_gpt_score = None
+    gpt_scores = []
+    rejected_gpt_scores = []
+    eval_error = None
+
+    if n_candidates < 2:
+        gpt_score = 2.5
+        relative_gpt_score = 0.0
+        relative_mean_gpt_score = 0.0
+    else:
+        eval_retries = 0
+        while True:
+            try:
+                result = scoring_model.generate(eval_prompt, cfg=score_cfg)
+                score_output = result["output"]
+                if "usage" in result:
+                    usage_stats["scoring_input"] += result["usage"].get("prompt_tokens", 0)
+                    usage_stats["scoring_output"] += result["usage"].get("completion_tokens", 0)
+                score_json = _extract_json(score_output)
+                scores = score_json["scores"]
+                if not isinstance(scores, list) or len(scores) != n_candidates:
+                    raise ValueError(
+                        f"scores length mismatch: expected {n_candidates}, got "
+                        f"{len(scores) if isinstance(scores, list) else 'non-list'}"
+                    )
+                gpt_scores = [float(s) for s in scores]
+                gpt_score = gpt_scores[resolved_chosen_idx]
+                rejected_gpt_scores = [s for i, s in enumerate(gpt_scores) if i != resolved_chosen_idx]
+                relative_gpt_score = gpt_score - max(rejected_gpt_scores)
+                relative_mean_gpt_score = gpt_score - (sum(rejected_gpt_scores) / len(rejected_gpt_scores))
+                break
+            except Exception as exc:
+                eval_retries += 1
+                if eval_retries > score_cfg.max_retries:
+                    eval_error = str(exc)
+                    break
+
+    # --- Embedding similarity ---
+    similarity_score = None
+    relative_score = None
+    relative_mean_score = None
+    similarity_scores = []
+    rejected_similarity_scores = []
+    try:
+        similarity_scores = candidate_similarity_scores(adapted_response, current_turn.candidates, embed_cfg)
+        similarity_score = similarity_scores[resolved_chosen_idx]
+        rejected_similarity_scores = [s for i, s in enumerate(similarity_scores) if i != resolved_chosen_idx]
+        relative_score = similarity_score - max(rejected_similarity_scores) if rejected_similarity_scores else 0.0
+        relative_mean_score = (
+            similarity_score - (sum(rejected_similarity_scores) / len(rejected_similarity_scores))
+            if rejected_similarity_scores
+            else 0.0
+        )
+    except Exception as exc:
+        print(f"[WARN] Embedding similarity computation failed: {exc}")
+
+    adaptation = {
+        "success": eval_error is None and gpt_score is not None,
+        "gpt_score": gpt_score,
+        "relative_gpt_score": relative_gpt_score,
+        "relative_mean_gpt_score": relative_mean_gpt_score,
+        "gpt_scores": gpt_scores,
+        "rejected_gpt_scores": rejected_gpt_scores,
+        "similarity_score": similarity_score,
+        "relative_score": relative_score,
+        "relative_mean_score": relative_mean_score,
+        "similarity_scores": similarity_scores,
+        "rejected_similarity_scores": rejected_similarity_scores,
+        "chosen_idx": resolved_chosen_idx,
+    }
+    if eval_error:
+        adaptation["error"] = eval_error
+
+    return {
+        "prediction": {
+            "success": True,
+            "accuracy": accuracy,
+            "ranking_score": ranking_score,
+            "ranking": ranking,
+            "chosen_idx": resolved_chosen_idx,
+        },
+        "adaptation": adaptation,
+        "usage": usage_stats,
+    }
+
+
+def _safe_mean(values):
+    clean = [v for v in values if v is not None]
+    return mean(clean) if clean else None
+
+
+def summarize_user_metrics(turns: List[Dict]) -> Dict:
+    """Match v2's summarize_user_metrics structure."""
+    predictions = [t["prediction"] for t in turns]
+    valid_pred = [p for p in predictions if p.get("success")]
+    adaptations = [t["adaptation"] for t in turns]
+    valid_adapt = [a for a in adaptations if a.get("success")]
+    return {
+        "n_turns": len(turns),
+        "n_prediction_turns": len(valid_pred),
+        "n_adaptation_turns": len(valid_adapt),
+        "prediction_success_rate": _safe_mean([1.0 if p.get("success") else 0.0 for p in predictions]),
+        "prediction_accuracy": _safe_mean([p.get("accuracy") for p in valid_pred]),
+        "prediction_ranking_score": _safe_mean([p.get("ranking_score") for p in valid_pred]),
+        "adapt_gpt_score": _safe_mean([a.get("gpt_score") for a in valid_adapt]),
+        "adapt_relative_gpt_score": _safe_mean([a.get("relative_gpt_score") for a in valid_adapt]),
+        "adapt_relative_mean_gpt_score": _safe_mean([a.get("relative_mean_gpt_score") for a in valid_adapt]),
+        "adapt_similarity_score": _safe_mean([a.get("similarity_score") for a in valid_adapt]),
+        "adapt_relative_score": _safe_mean([a.get("relative_score") for a in valid_adapt]),
+        "adapt_relative_mean_score": _safe_mean([a.get("relative_mean_score") for a in valid_adapt]),
+    }
+
+
+def summarize_all_metrics(user_records: List[Dict]) -> Dict:
+    """Match v2's summarize_metrics structure."""
+    all_turns = [t for rec in user_records for t in rec.get("turns", [])]
+    all_predictions = [t["prediction"] for t in all_turns]
+    valid_pred = [p for p in all_predictions if p.get("success")]
+    all_adaptations = [t["adaptation"] for t in all_turns]
+    valid_adapt = [a for a in all_adaptations if a.get("success")]
+
+    max_turn_index = max((len(rec.get("turns", [])) for rec in user_records), default=0)
+    online_turns = []
+    for turn_index in range(max_turn_index):
+        turn_slices = [
+            rec["turns"][turn_index]
+            for rec in user_records
+            if turn_index < len(rec.get("turns", []))
+        ]
+        preds = [t["prediction"] for t in turn_slices]
+        valid_tp = [p for p in preds if p.get("success")]
+        adapts = [t["adaptation"] for t in turn_slices]
+        valid_ta = [a for a in adapts if a.get("success")]
+        online_turns.append({
+            "turn_index": turn_index,
+            "n_users": len(turn_slices),
+            "n_prediction_users": len(valid_tp),
+            "n_adaptation_users": len(valid_ta),
+            "prediction_accuracy": _safe_mean([p.get("accuracy") for p in valid_tp]),
+            "prediction_ranking_score": _safe_mean([p.get("ranking_score") for p in valid_tp]),
+            "adapt_gpt_score": _safe_mean([a.get("gpt_score") for a in valid_ta]),
+            "adapt_relative_gpt_score": _safe_mean([a.get("relative_gpt_score") for a in valid_ta]),
+            "adapt_relative_mean_gpt_score": _safe_mean([a.get("relative_mean_gpt_score") for a in valid_ta]),
+            "adapt_similarity_score": _safe_mean([a.get("similarity_score") for a in valid_ta]),
+            "adapt_relative_score": _safe_mean([a.get("relative_score") for a in valid_ta]),
+            "adapt_relative_mean_score": _safe_mean([a.get("relative_mean_score") for a in valid_ta]),
+        })
+
+    return {
+        "n_users": len(user_records),
+        "n_turns": len(all_turns),
+        "online_turns": online_turns,
+        "overall_prediction": {
+            "prediction_accuracy": _safe_mean([p.get("accuracy") for p in valid_pred]),
+            "prediction_ranking_score": _safe_mean([p.get("ranking_score") for p in valid_pred]),
+        },
+        "overall_adaptation": {
+            "adapt_gpt_score": _safe_mean([a.get("gpt_score") for a in valid_adapt]),
+            "adapt_relative_gpt_score": _safe_mean([a.get("relative_gpt_score") for a in valid_adapt]),
+            "adapt_relative_mean_gpt_score": _safe_mean([a.get("relative_mean_gpt_score") for a in valid_adapt]),
+            "adapt_similarity_score": _safe_mean([a.get("similarity_score") for a in valid_adapt]),
+            "adapt_relative_score": _safe_mean([a.get("relative_score") for a in valid_adapt]),
+            "adapt_relative_mean_score": _safe_mean([a.get("relative_mean_score") for a in valid_adapt]),
+        },
+        "users": {rec["user"]: rec.get("summary", {}) for rec in user_records},
+    }
+
+
+def run_baseline(args):
+    random.seed(args.seed)
+
+    reasoning_model = build_model(
+        backend=args.reasoning_backend,
+        model_name=args.reasoning_model,
+        base_url=args.reasoning_base_url,
+        api_key=args.reasoning_api_key,
+        hf_enable_thinking=args.hf_enable_thinking,
+    )
+    scoring_model = build_model(
+        backend=args.score_backend,
+        model_name=args.score_model,
+        base_url=args.score_base_url,
+        api_key=args.score_api_key,
+        hf_enable_thinking=False,
+    )
+
+    reasoning_cfg = GenerationConfig(
+        model=args.reasoning_model,
+        max_tokens=args.reasoning_max_tokens,
+        temperature=0.0,
+        max_retries=args.max_retries,
+        retry_delay=args.retry_delay,
+        reasoning_effort=args.reasoning_effort,
+    )
+    score_cfg = GenerationConfig(
+        model=args.score_model,
+        max_tokens=args.score_max_tokens,
+        temperature=0.0,
+        max_retries=args.max_retries,
+        retry_delay=args.retry_delay,
+        reasoning_effort=args.score_reasoning_effort,
+    )
+
+    embed_cfg = EmbedConfig(
+        backend="openai",
+        model=args.embed_model,
+        api_key=args.embed_api_key or args.score_api_key,
+        base_url=args.embed_base_url or "https://api.openai.com/v1",
+    )
+
+    loaded_users = load_data(args.dataset, n_users=args.n_users, seed=args.seed)
+    users = loaded_users[: args.users_per_run] if args.users_per_run is not None else loaded_users
+
+    # Create output directory
+    run_dir = os.path.join(args.output_dir, args.run_id)
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Pre-compute total evaluable turns for progress reporting.
+    total_turns_planned = 0
+    for user in users:
+        for conv in user.conversations:
+            for turn in conv.turns:
+                if _resolve_chosen_idx(turn) >= 0:
+                    total_turns_planned += 1
+
+    total_usage = {"reasoning_input": 0, "reasoning_output": 0, "scoring_input": 0, "scoring_output": 0}
+    skipped_unlabeled_turns = 0
+    processed_turns = 0
+    completed_users = 0
+    user_records: List[Dict] = []
+    per_user_usage = []
+
+    for user in users:
+        print(
+            f"[Progress] User {completed_users + 1}/{len(users)} ({user.user_id}) started. "
+            f"Processed turns: {processed_turns}/{total_turns_planned}."
+        )
+        user_turns: List[Dict] = []
+        user_usage = {"reasoning_input": 0, "reasoning_output": 0, "scoring_input": 0, "scoring_output": 0}
+        turn_index = 0  # Global turn index across all conversations for this user
+        for conv in user.conversations:
+            conversation_history: List[Turn] = []
+            for turn in conv.turns:
+                resolved_chosen_idx = _resolve_chosen_idx(turn)
+                if resolved_chosen_idx < 0:
+                    skipped_unlabeled_turns += 1
+                    continue
+
+                if resolved_chosen_idx != turn.chosen_idx:
+                    turn.chosen_idx = resolved_chosen_idx
+
+                conversation_history.append(turn)
+                result = predict_ranking_and_metrics(
+                    reasoning_model=reasoning_model,
+                    scoring_model=scoring_model,
+                    conversation_history=conversation_history,
+                    reasoning_cfg=reasoning_cfg,
+                    score_cfg=score_cfg,
+                    embed_cfg=embed_cfg,
+                    top_k=args.top_k,
+                    max_chars=args.max_chars,
+                    ranking_fail_mode=args.ranking_fail_mode,
+                )
+
+                for key in ["reasoning_input", "reasoning_output", "scoring_input", "scoring_output"]:
+                    user_usage[key] += result["usage"].get(key, 0)
+                    total_usage[key] += result["usage"].get(key, 0)
+
+                turn_record = {
+                    "turn_index": turn_index,
+                    "turn_id": getattr(turn, "turn_id", None),
+                    "prediction": result["prediction"],
+                    "adaptation": result["adaptation"],
+                }
+                user_turns.append(turn_record)
+                turn_index += 1
+                processed_turns += 1
+
+                if processed_turns in [1, 3, 5]:
+                    current_cost = calculate_cost(total_usage, args.reasoning_model, args.score_model)
+                    total_tokens = sum(total_usage.values())
+                    print(
+                        f"[Cost Debug] After {processed_turns} turn(s): "
+                        f"${current_cost:.6f} USD, {total_tokens:,} tokens "
+                        f"(R: {total_usage['reasoning_input']+total_usage['reasoning_output']}, "
+                        f"S: {total_usage['scoring_input']+total_usage['scoring_output']})"
+                    )
+
+                if processed_turns % 10 == 0 or processed_turns == total_turns_planned:
+                    pct = (100.0 * processed_turns / total_turns_planned) if total_turns_planned else 100.0
+                    current_cost = calculate_cost(total_usage, args.reasoning_model, args.score_model)
+                    print(
+                        f"[Progress] Turns {processed_turns}/{total_turns_planned} "
+                        f"({pct:.1f}%), skipped_unlabeled={skipped_unlabeled_turns}, "
+                        f"cost=${current_cost:.4f}"
+                    )
+
+        user_cost = calculate_cost(user_usage, args.reasoning_model, args.score_model)
+        per_user_usage.append({"user_id": user.user_id, "usage": user_usage, "cost_usd": user_cost})
+
+        user_record = {
+            "user": user.user_id,
+            "turns": user_turns,
+            "summary": summarize_user_metrics(user_turns),
+        }
+        user_records.append(user_record)
+        completed_users += 1
+        print(
+            f"[Progress] User {completed_users}/{len(users)} completed. "
+            f"Processed turns: {processed_turns}/{total_turns_planned}, "
+            f"skipped_unlabeled={skipped_unlabeled_turns}."
+        )
+
+    # Build outputs
+    summary = summarize_all_metrics(user_records)
+    total_cost = calculate_cost(total_usage, args.reasoning_model, args.score_model)
+    average_cost_per_user = total_cost / len(users) if users else 0.0
+    cost_summary = {
+        "total_usage": total_usage,
+        "total_cost_usd": total_cost,
+        "average_cost_per_user_usd": average_cost_per_user,
+        "per_user_usage": per_user_usage,
+        "pricing_info": {
+            "reasoning_model": args.reasoning_model,
+            "scoring_model": args.score_model,
+        },
+    }
+
+    # Define output paths (matching v2 layout)
+    run_dir_path = Path(run_dir)
+    users_dir = run_dir_path / "users"
+    users_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = run_dir_path / "summary.json"
+    cost_path = run_dir_path / "cost_report.json"
+    trend_plot_path = run_dir_path / "turn_metric_trends.png"
+
+    # Write per-user JSON files
+    for rec in user_records:
+        _write_json(users_dir / f"{rec['user']}.json", rec)
+
+    # Write global summary and cost
+    _write_json(summary_path, summary)
+    _write_json(cost_path, cost_summary)
+
+    # Generate trend plot (from online_turns in summary)
+    plot_data = {}
+    for ot in summary.get("online_turns", []):
+        t = str(ot["turn_index"])
+        plot_data[t] = {
+            "accuracy": ot.get("prediction_accuracy") or 0.0,
+            "ranking_score": ot.get("prediction_ranking_score") or 0.0,
+            "generation_score": ot.get("adapt_gpt_score") or 0.0,
+            "relative_gpt_score": ot.get("adapt_relative_gpt_score") or 0.0,
+            "similarity_score": ot.get("adapt_similarity_score") or 0.0,
+            "relative_similarity_score": ot.get("adapt_relative_score") or 0.0,
+        }
+    _plot_turn_trends(plot_data, str(trend_plot_path))
+
+    # Print summary
+    overall_pred = summary.get("overall_prediction", {})
+    overall_adapt = summary.get("overall_adaptation", {})
+    print("\n=== RAG Baseline Complete ===")
+    print(json.dumps({**overall_pred, **overall_adapt}, indent=2))
+    print("\n=== Cost Summary ===")
+    print(f"Total cost: ${total_cost:.4f} USD")
+    print(f"Average cost per user: ${average_cost_per_user:.4f} USD")
+    print(f"Total tokens: {sum(total_usage.values()):,}")
+    print(f"\nSaved per-user records: {users_dir}/")
+    print(f"Saved summary: {summary_path}")
+    print(f"Saved cost report: {cost_path}")
+    print(f"Saved turn trend plot: {trend_plot_path}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run RAG baseline with embedding-based retrieval (no preference tracing)")
+    parser.add_argument("--dataset", type=str, default="prism")
+    parser.add_argument("--n-users", type=int, default=1000)
+    parser.add_argument("--users-per-run", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument("--reasoning-backend", type=str, choices=["hf", "openai", "openrouter"], default="hf")
+    parser.add_argument("--reasoning-model", type=str, default="Qwen/Qwen3-4B")
+    parser.add_argument(
+        "--reasoning-base-url",
+        type=str,
+        default=None,
+        help="API base URL (auto-set for openrouter; default https://api.openai.com/v1 for openai)",
+    )
+    parser.add_argument("--reasoning-api-key", type=str, default=None)
+    parser.add_argument("--reasoning-max-tokens", type=int, default=256)
+    parser.add_argument("--reasoning-effort", type=str, default="minimal")
+
+    parser.add_argument("--score-backend", type=str, choices=["hf", "openai", "openrouter"], default="openai")
+    parser.add_argument("--score-model", type=str, default="gpt-5")
+    parser.add_argument(
+        "--score-base-url",
+        type=str,
+        default=None,
+        help="API base URL (auto-set for openrouter; default https://api.openai.com/v1 for openai)",
+    )
+    parser.add_argument("--score-api-key", type=str, default=None)
+    parser.add_argument("--score-max-tokens", type=int, default=256)
+    parser.add_argument("--score-reasoning-effort", type=str, default="minimal")
+
+    parser.add_argument(
+        "--embed-model",
+        type=str,
+        default="text-embedding-3-small",
+        help="Embedding model used for both retrieval and similarity metrics",
+    )
+    parser.add_argument(
+        "--embed-api-key",
+        type=str,
+        default=None,
+        help="OpenAI API key for embeddings (defaults to --score-api-key if not set)",
+    )
+    parser.add_argument(
+        "--embed-base-url",
+        type=str,
+        default=None,
+        help="Base URL for embeddings API (defaults to https://api.openai.com/v1)",
+    )
+
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=3,
+        help="Number of past interactions to retrieve per turn (RAG retrieval window)",
+    )
+    parser.add_argument("--max-chars", type=int, default=280)
+    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--retry-delay", type=float, default=0.5)
+    parser.add_argument("--ranking-fail-mode", type=str, choices=["raise", "fallback"], default="fallback")
+
+    parser.add_argument("--hf-enable-thinking", action="store_true")
+
+    parser.add_argument("--output-dir", type=str, default="baseline_results")
+    parser.add_argument("--run-id", type=str, default="rag_gpt5_openrouter")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    run_baseline(parse_args())
