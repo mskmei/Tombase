@@ -67,7 +67,8 @@ def load_prism(n_users: int = None, seed: int = None) -> List[UserData]:
     survey_data = load_dataset("HannahRoseKirk/prism-alignment", "survey")['train']
     survey_rec = {rec['user_id']: rec for rec in survey_data}
 
-    # --- Build all users first, apply MIN_USER_TURNS filter ---
+    # --- Build all users in dataset order, apply MIN_USER_TURNS filter ---
+    # Matches preference-tracing-v2/data/prism.py exactly.
     all_users: List[UserData] = []
     skipped_short = 0
     for uid in user_order:
@@ -94,10 +95,14 @@ def load_prism(n_users: int = None, seed: int = None) -> List[UserData]:
     print(
         f"[Data] Total users in dataset: {len(user_order)}  |  "
         f"Skipped (turns < {MIN_USER_TURNS}): {skipped_short}  |  "
-        f"Eligible users: {len(all_users)}"
+        f"Eligible: {len(all_users)}"
     )
 
-    # --- Sample from eligible users ---
+    # --- Sample only if eligible > n_users (matches v2 logic exactly) ---
+    # With n_users=1000 and ~619 eligible, condition is False → return all 619
+    # in dataset order (no shuffle).  The first users_per_run entries are
+    # therefore the first N eligible users in the original dataset order,
+    # which is what v2 does and what produces the expected user_ids.
     if n_users is not None and len(all_users) > n_users:
         random.seed(seed)
         users = random.sample(all_users, n_users)
@@ -106,7 +111,7 @@ def load_prism(n_users: int = None, seed: int = None) -> List[UserData]:
 
     print(
         f"[Data] Requested n_users={n_users}  |  "
-        f"Final selected: {len(users)}  |  "
+        f"Final pool: {len(users)}  |  "
         f"Avg turns/user: {sum(sum(len(c.turns) for c in u.conversations) for u in users) / len(users):.1f}"
     )
     return users
