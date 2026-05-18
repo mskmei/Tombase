@@ -98,14 +98,13 @@ def load_prism(n_users: int = None, seed: int = None) -> List[UserData]:
         f"Eligible: {len(all_users)}"
     )
 
-    # --- Sample only if eligible > n_users (matches v2 logic exactly) ---
-    # With n_users=1000 and ~619 eligible, condition is False → return all 619
-    # in dataset order (no shuffle).  The first users_per_run entries are
-    # therefore the first N eligible users in the original dataset order,
-    # which is what v2 does and what produces the expected user_ids.
-    if n_users is not None and len(all_users) > n_users:
+    # --- Always shuffle with seed when n_users is specified ---
+    # random.sample(pool, len(pool)) is a seeded shuffle. This ensures
+    # users_per_run slicing always picks a reproducible random subset
+    # regardless of whether eligible count exceeds n_users.
+    if n_users is not None:
         random.seed(seed)
-        users = random.sample(all_users, n_users)
+        users = random.sample(all_users, min(n_users, len(all_users)))
     else:
         users = all_users
 
